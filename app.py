@@ -2,12 +2,6 @@ import os
 import gradio as gr
 from dotenv import load_dotenv
 from crewai import Agent, Task, Crew
-from tools.google_maps_tool import GoogleMapsTool
-from tools.route_planner_tool import RoutePlannerTool
-from tools.weather_tool import WeatherTool
-from tools.semantic_ranking_tool import SemanticRankingTool
-from models.itinerary_model import ItineraryModel
-from utils.date_utils import expand_dates
 
 import warnings
 warnings.filterwarnings("ignore", category=ResourceWarning)
@@ -15,19 +9,42 @@ warnings.filterwarnings("ignore", category=ResourceWarning)
 # Load environment variables
 load_dotenv()
 
+print("🔍 GOOGLE_MAPS_API_KEY found:", bool(os.getenv("GOOGLE_MAPS_API_KEY")))
+print("🔍 OPENAI_API_KEY found:", bool(os.getenv("OPENAI_API_KEY")))
+
 # ✅ Ensure LiteLLM knows you’re using OpenAI models
 os.environ["LITELLM_PROVIDER"] = "openai"
 os.environ["OPENAI_API_BASE"] = "https://api.openai.com/v1"
 
 # ✅ Confirm key is available
 if not os.getenv("OPENAI_API_KEY"):
-    raise ValueError("Missing OPENAI_API_KEY — check your .env file")
+    raise ValueError("Missing OPENAI_API_KEY")
+if not os.getenv("GOOGLE_MAPS_API_KEY"):
+    print("⚠️ Warning: Missing GOOGLE_MAPS_API_KEY")
+
+
+from tools.google_maps_tool import GoogleMapsTool
+from tools.route_planner_tool import RoutePlannerTool
+from tools.weather_tool import WeatherTool
+from tools.semantic_ranking_tool import SemanticRankingTool
+from models.itinerary_model import ItineraryModel
+from utils.date_utils import expand_dates
 
 #Initialize Tools
-maps_tool = GoogleMapsTool()
-route_tool = RoutePlannerTool()
-weather_tool = WeatherTool()
-semantic_ranking_tool = SemanticRankingTool()
+def create_tools():
+    """Instantiate tools only after environment is ready."""
+    return {
+        "maps": GoogleMapsTool(),
+        "route": RoutePlannerTool(),
+        "weather": WeatherTool(),
+        "semantic": SemanticRankingTool(),
+    }
+
+tools = create_tools()
+maps_tool = tools["maps"]
+route_tool = tools["route"]
+weather_tool = tools["weather"]
+semantic_ranking_tool = tools["semantic"]
 
 
 #Define agents
