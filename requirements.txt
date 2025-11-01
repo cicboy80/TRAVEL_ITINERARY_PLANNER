@@ -18,3 +18,6 @@ googlemaps>=4.10.0
 
 # (Optional) For advanced ranking, weather, or geospatial logic
 numpy>=1.26.4
+
+qdrant-client>=1.7.0
+weaviate-client
