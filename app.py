@@ -3,6 +3,9 @@ import gradio as gr
 from dotenv import load_dotenv
 from crewai import Agent, Task, Crew
 
+import warnings
+warnings.filterwarnings("ignore", category=ResourceWarning)
+
 # Load environment variables
 load_dotenv()
 
