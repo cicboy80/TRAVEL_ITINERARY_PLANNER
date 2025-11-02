@@ -230,10 +230,14 @@ def generate_itinerary(location, start_date, end_date, preferences, transport_mo
         "trip_duration_days": trip_duration_days
     })
 
-    itinerary_json = planning_task.output.result if planning_task.output and hasattr(writing_task.output, "result") else "No structured itinerary generated"
-    markdown_itinerary = writing_task.output.result if writing_task.output and hasattr(writing_task.output, "result") else "No markdown itinerary generated"
+    itinerary_json = getattr(planning_task.output, "result", planning_task.output)
+    markdown_itinerary = getattr(writing_task.output, "result", writing_task.output)
+
+    if not markdown_itinerary:
+        markdown_itinerary = "⚠️ No Markdown itinerary returned by Writer Agent."
 
     return markdown_itinerary
+
 
 # Gradio UI
 with gr.Blocks(theme=gr.themes.Soft()) as demo:
