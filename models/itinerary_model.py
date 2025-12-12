@@ -14,9 +14,9 @@ class Activity(BaseModel):
     rating: Optional[float] = Field(None, description="Average rating score (if available)")
     reasoning: Optional[str] = Field(None, description="Reason why this activity was selected")
     weather_forecast: Optional[str] = Field(None, description="Expected weather at this time/location")
+    travel_mode: Optional[str] = Field(None, description="Mode used to reach this activity (walking/public_transport/driving/cycling)")
     distance_from_prev: Optional[float] = Field(None, description="Distance from previous activity in kilometers")
     duration_minutes: Optional[int] = Field(None, description="Automatically computed duration in minutes.")
-
 
 # 📅 Daily itinerary
 class DayPlan(BaseModel):
@@ -25,12 +25,11 @@ class DayPlan(BaseModel):
     summary: Optional[str] = Field(None, description="High-level overview of the day")
     activities: List[Activity] = Field(..., description="Ordered list of daily activities and meals")
 
-
 # 🌍 Entire trip plan
 class ItineraryModel(BaseModel):
     destination: str = Field(..., description="City or region of the trip")
     trip_duration_days: int = Field(..., description="Number of days in the itinerary")
-    transport_mode: Optional[str] = Field(None, description="User's preferred mode of transport (walking, public_transport, driving)")
+    transport_modes: List[str] = Field(default_factory=list, description="Allowed modes: walking, public_transport, driving, cycling")
     start_date: Optional[str] = Field(None, description="Trip start date (ISO format)")
     end_date: Optional[str] = Field(None, description="End date (YYYY-MM-DD).")
     traveler_profile: Optional[str] = Field(None, description="Short description of traveler preferences.")

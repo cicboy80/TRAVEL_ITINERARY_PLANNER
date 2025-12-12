@@ -12,11 +12,10 @@ load_dotenv()
 print("🔍 GOOGLE_MAPS_API_KEY found:", bool(os.getenv("GOOGLE_MAPS_API_KEY")))
 print("🔍 OPENAI_API_KEY found:", bool(os.getenv("OPENAI_API_KEY")))
 
-# ✅ Ensure LiteLLM knows you’re using OpenAI models
 os.environ["LITELLM_PROVIDER"] = "openai"
 os.environ["OPENAI_API_BASE"] = "https://api.openai.com/v1"
 
-# ✅ Confirm key is available
+# Confirm key is available
 if not os.getenv("OPENAI_API_KEY"):
     raise ValueError("Missing OPENAI_API_KEY")
 if not os.getenv("GOOGLE_MAPS_API_KEY"):
@@ -56,7 +55,7 @@ retriever_agent = Agent(
     tools=[maps_tool],
     llm="gpt-4o-mini",
     temperature=0.2,
-    verbose=True
+    verbose=False
 )
 
 weather_agent = Agent(
@@ -66,7 +65,7 @@ weather_agent = Agent(
     tools=[weather_tool],
     llm="gpt-4o-mini",
     temperature=0.2,
-    verbose=True
+    verbose=False
 )
 
 route_agent = Agent(
@@ -74,9 +73,9 @@ route_agent = Agent(
     goal="Calculate walking, driving, cycling, public transport times between trip locations to optimize daily routes.",
     backstory="A navigtion expert skilled at minimizing time and building efficient routes.",
     tools=[route_tool],
-    llm="gpt-5-mini",
+    llm="gpt-4o-mini",
     temperature=0.25,
-    verbose=True
+    verbose=False
 )
 
 planner_agent = Agent(
@@ -91,7 +90,7 @@ planner_agent = Agent(
     temperature=0.3,
     output_schema=ItineraryModel,
     reasoning=True,
-    verbose=True
+    verbose=False
 )
 
 writer_agent = Agent(
@@ -108,15 +107,20 @@ writer_agent = Agent(
     ),
     llm="gpt-4o",
     temperature=0.7,
-    verbose=True
+    verbose=False
 )
 
 # Core logic
 def generate_itinerary(location, start_date, end_date, preferences, transport_modes ):
-    trip_duration_days = len(expand_dates(start_date, end_date))
-    transport_modes_str = ', '.join(transport_modes) if isinstance(transport_modes, list) else transport_modes
+    days, date_list = expand_dates(start_date, end_date)
+    trip_duration_days = days
+    
+    if isinstance(transport_modes, str):
+        transport_modes = [transport_modes]
+    
+    transport_modes_str = ", ".join(transport_modes)
 
-#Define the tasks
+    #Define the tasks
 
     retrieval_task = Task(
         description=f"Gather restaurants, landmarks, and activities for the trip in {location}.",
@@ -133,13 +137,18 @@ def generate_itinerary(location, start_date, end_date, preferences, transport_mo
     )
 
     route_task = Task(
-        description=(f"Using the candidate places retrieved, compute optimal routes using the following transport modes: {transport_modes_str}. "
-            "Use walking for short distances (<2km) and public transport for longer ones. "
-            "Return route data including mode, distance, and estimated time."
+        description=(
+            f"From the RetrieverTask output, build a destinations list (strings) using the "
+            f"top 10 places across categories (prefer formatted address if present, else name + city). "
+            f"Use origin='{location}'. Then call Route Planner Tool exactly once with:\n"
+            f"- origin: '{location}'\n"
+            f"- destinations: <that list>\n"
+            f"- modes: {transport_modes}\n"
+            f"Return the tool output as JSON."
         ),
-        expected_output="A list of routes with mode, distance and duration in minutes.",
+        expected_output="A JSON list of routes with mode, distance_km, duration_min, destination.",
         agent=route_agent,
-        inputs = {"mode": {transport_modes_str}}
+        context=[retrieval_task]
     )
 
     planning_task = Task(
@@ -174,9 +183,40 @@ def generate_itinerary(location, start_date, end_date, preferences, transport_mo
             "   - weather_forecast (if applicable)\n"
             "   - distance_from_prev (km)\n"
             "   - travel_duration_min (if applicable)\n\n"
-            "🔟 Return a structured JSON object grouped by day with weather, schedule, and reasoning "
-            "following the ItineraryModel format. Ensure the JSON output strictly follows the ItineraryModel schema fields "
-            "(days[], events[], metadata, reasoning)."
+            "🔟 Output format (MUST match ItineraryModel exactly):\n"
+            "{\n"
+            '  "destination": "<city/region>",\n'
+            '  "trip_duration_days": <int>,\n'
+            '  "transport_mode": ["walking", "public_transport", "driving", "cycling"],\n'
+            '  "start_date": "YYYY-MM-DD",\n'
+            '  "end_date": "YYYY-MM-DD",\n'
+            '  "traveler_profile": "<short preference summary>",\n'
+            '  "days": [\n'
+            "    {\n"
+            '      "date": "YYYY-MM-DD",\n'
+            '      "weather_summary": "<string>",\n'
+            '      "summary": "<string>",\n'
+            '      "activities": [\n'
+            "        {\n"
+            '          "name": "<place name>",\n'
+            '          "category": "<breakfast|lunch|dinner|museum|park|landmark|...>",\n'
+            '          "start_time": "HH:MM",\n'
+            '          "end_time": "HH:MM",\n'
+            '          "location": "<address>",\n'
+            '          "map_url": "<optional>",\n'
+            '          "rating": <optional float>,\n'
+            '          "reasoning": "<optional>",\n'
+            '          "weather_forecast": "<optional>",\n'
+            '          "distance_from_prev": <optional float>,\n'
+            '          "duration_minutes": <optional int>\n'
+            "        }\n"
+            "      ]\n"
+            "    }\n"
+            "  ],\n"
+            '  "total_distance_km": <optional float>,\n'
+            '  "notes": "<optional>"\n'
+            "}\n"
+            "⚠️ Use field name 'activities' (NOT events). Use 'duration_minutes' (NOT travel_duration_min)."
         ),
         expected_output="A structured JSON itinerary with complete metadata and travel-aware timestamps for each activity.",
         context=[retrieval_task, weather_task, route_task],
@@ -190,9 +230,9 @@ def generate_itinerary(location, start_date, end_date, preferences, transport_mo
         description=(
             "You are a professional travel writer. Given a structured itinerary JSON with detailed fields "
             "(rating, reasoning, distance_from_prev, weather_forecast), write an engaging Markdown itinerary.\n\n"
-            "Make sure the itinerary is covering the period {start_date} to {end_date}.\n\n"
+            f"Make sure the itinerary is covering the period {start_date} to {end_date}.\n\n"
             "At the top of the Markdown output, include a summary line like:\n"
-            "'**Trip Dates:** {start_date} → {end_date} \n"
+            f"'**Trip Dates:** {start_date} → {end_date} \n"
             "Each day must include:\n"
             "- The date and weather summary from the JSON.\n"
             "- Chronological itinerary entries with start and end times.\n"
@@ -229,15 +269,10 @@ def generate_itinerary(location, start_date, end_date, preferences, transport_mo
     })
 
     # Safely extract the result
-    if hasattr(writing_task.output, "result"):
-        markdown_itinerary = writing_task.output.result
-    else:
-        markdown_itinerary = str(writing_task.output) if writing_task.output else "⚠️ No Markdown itinerary generated."
-
-    # Ensure final output is always a string
-    if not isinstance(markdown_itinerary, str):
-        markdown_itinerary = str(markdown_itinerary)
-
+    markdown_itinerary = (
+        result if isinstance(result, str)
+        else getattr(result, "raw", None) or str(result)
+    )
     return markdown_itinerary
 
 # Gradio UI

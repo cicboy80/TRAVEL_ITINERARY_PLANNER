@@ -1,5 +1,5 @@
 import httpx
-from crewai_tools import RagTool
+from crewai.tools import BaseTool
 from pydantic import BaseModel, Field
 from typing import Dict, Optional, Any, Type
 from datetime import date, timedelta
@@ -11,10 +11,11 @@ class WeatherToolInput(BaseModel):
     city: Optional[str] = Field(None, description="City name, e.g. 'Florence, Italy'.")
     latitude: Optional[float] = Field(None, description="Latitude in decimal degrees.")
     longitude: Optional[float] = Field(None, description="Longitude in decimal degrees.")
-
+    start_date: Optional[str] = Field(None, description="YYYY-MM-DD")
+    end_date: Optional[str] = Field(None, description="YYYY-MM-DD")
 
 # 🌤️ CrewAI Tool
-class WeatherTool(RagTool):
+class WeatherTool(BaseTool):
     """Fetches multi-day weather forecasts using the Open-Meteo API."""
 
     name: str = "Weather Forecast Tool"
@@ -64,6 +65,10 @@ class WeatherTool(RagTool):
             "daily": "temperature_2m_max,temperature_2m_min,precipitation_sum",
             "timezone": "auto",
         }
+
+        if start_date and end_date:
+            params["start_date"] = start_date
+            params["end_date"] = end_date
 
         resp = httpx.get(base_url, params=params, timeout=10.0)
         data = resp.json()

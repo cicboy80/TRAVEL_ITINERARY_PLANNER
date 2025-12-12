@@ -1,9 +1,9 @@
 import os
 import httpx
 from typing import List, Dict, Optional
-from crewai_tools import RagTool
+from crewai.tools import BaseTool
 
-class GoogleMapsTool(RagTool):
+class GoogleMapsTool(BaseTool):
     """
     CrewAI compatible toool for querying Google Places Api
     """

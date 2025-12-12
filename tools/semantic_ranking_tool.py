@@ -2,13 +2,13 @@ import os
 import numpy as np
 from typing import List, Dict, Any, Optional
 from openai import OpenAI
-from crewai_tools import RagTool
+from crewai.tools import BaseTool
 from dotenv import load_dotenv
 
 load_dotenv()
 os.environ["CHROMA_OPENAI_API_KEY"] = os.getenv("OPENAI_API_KEY")
 
-class SemanticRankingTool(RagTool):
+class SemanticRankingTool(BaseTool):
     """
     CrewAI-compatible tool that semantically ranks and filters candidate places
     based on user preferences, ratings, popularity, and optional distance.

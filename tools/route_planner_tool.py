@@ -1,10 +1,10 @@
 import os
 import httpx
 from typing import List, Dict, Union, Optional
-from crewai_tools.tools import RagTool
+from crewai.tools import BaseTool
 
 
-class RoutePlannerTool(RagTool):
+class RoutePlannerTool(BaseTool):
     """
     CrewAI-compatible tool for computing optimal routes between locations
     using Google Directions API with multi-mode transport support.
@@ -47,49 +47,57 @@ class RoutePlannerTool(RagTool):
         base_url = "https://maps.googleapis.com/maps/api/directions/json"
         results = []
 
-        for dest in destinations[:max_results]:
-            best_route = None
+        with httpx.Client(timeout=20.0) as client:
+            for dest in destinations[:max_results]:
+                best_route = None
 
-            # Try walking first
-            if "walking" in modes:
-                walk_params = {"origin": origin, "destination": dest, "mode": "walking", "key": api_key}
-                walk_data = self._fetch_route(base_url, walk_params)
-                if walk_data:
-                    best_route = {**walk_data, "mode": "walking"}
+                # Try walking first
+                if "walking" in modes:
+                    walk_params = {"origin": origin, "destination": dest, "mode": "walking", "key": api_key}
+                    walk_data = self._fetch_route(base_url, walk_params)
+                    if walk_data:
+                        best_route = {**walk_data, "mode": "walking"}
 
-            # Try public transport if walking route > 2km or not available
-            if ("public_transport" in modes or "transit" in modes) and (
-                not best_route or best_route["distance_km"] > 2
-            ):
-                transit_params = {
-                    "origin": origin,
-                    "destination": dest,
-                    "mode": "transit",
-                    "transit_mode": "bus|subway|train|tram",
-                    "key": api_key
-                }
-                transit_data = self._fetch_route(base_url, transit_params)
-                if transit_data:
-                    if not best_route or transit_data["duration_min"] < best_route["duration_min"]:
-                        best_route = {**transit_data, "mode": "public_transport"}
+                # Try public transport if walking route > 2km or not available
+                if ("public_transport" in modes or "transit" in modes) and (
+                    not best_route or best_route["distance_km"] > 2
+                ):
+                    transit_params = {
+                        "origin": origin,
+                        "destination": dest,
+                        "mode": "transit",
+                        "transit_mode": "bus|subway|train|tram",
+                        "key": api_key
+                    }
+                    transit_data = self._fetch_route(base_url, transit_params)
+                    if transit_data:
+                        if not best_route or transit_data["duration_min"] < best_route["duration_min"]:
+                            best_route = {**transit_data, "mode": "public_transport"}
+            
+                # Cycling if included
+                if "cycling" in modes and not best_route:
+                    bike_params = {"origin": origin, "destination": dest, "mode": "bicycling", "key": api_key}
+                    bike_data = self._fetch_route(client, base_url, bike_params)
+                    if bike_data:
+                        best_route = {**bike_data, "mode": "cycling"}
 
-            # Try driving if included and others unavailable
-            if "driving" in modes and not best_route:
-                drive_params = {"origin": origin, "destination": dest, "mode": "driving", "key": api_key}
-                drive_data = self._fetch_route(base_url, drive_params)
-                if drive_data:
-                    best_route = {**drive_data, "mode": "driving"}
+                # Try driving if included and others unavailable
+                if "driving" in modes and not best_route:
+                    drive_params = {"origin": origin, "destination": dest, "mode": "driving", "key": api_key}
+                    drive_data = self._fetch_route(base_url, drive_params)
+                    if drive_data:
+                        best_route = {**drive_data, "mode": "driving"}
 
-            if best_route:
-                best_route["destination"] = dest
-                results.append(best_route)
+                if best_route:
+                    best_route["destination"] = dest
+                    results.append(best_route)
 
-        return results
+            return results
 
-    def _fetch_route(self, base_url: str, params: Dict) -> Optional[Dict]:
+    def _fetch_route(self, client: httpx.Client, base_url: str, params: Dict) -> Optional[Dict]:
         """Fetch and parse route data from Google Directions API."""
         try:
-            response = httpx.get(base_url, params=params, timeout=20.0)
+            response = client.get(base_url, params=params, timeout=20.0)
             data = response.json()
 
             if data["status"] != "OK" or not data.get("routes"):
