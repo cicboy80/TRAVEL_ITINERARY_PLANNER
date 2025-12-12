@@ -54,7 +54,7 @@ class RoutePlannerTool(BaseTool):
                 # Try walking first
                 if "walking" in modes:
                     walk_params = {"origin": origin, "destination": dest, "mode": "walking", "key": api_key}
-                    walk_data = self._fetch_route(base_url, walk_params)
+                    walk_data = self._fetch_route(client, base_url, walk_params)
                     if walk_data:
                         best_route = {**walk_data, "mode": "walking"}
 
@@ -69,7 +69,7 @@ class RoutePlannerTool(BaseTool):
                         "transit_mode": "bus|subway|train|tram",
                         "key": api_key
                     }
-                    transit_data = self._fetch_route(base_url, transit_params)
+                    transit_data = self._fetch_route(client, base_url, transit_params)
                     if transit_data:
                         if not best_route or transit_data["duration_min"] < best_route["duration_min"]:
                             best_route = {**transit_data, "mode": "public_transport"}
@@ -84,7 +84,7 @@ class RoutePlannerTool(BaseTool):
                 # Try driving if included and others unavailable
                 if "driving" in modes and not best_route:
                     drive_params = {"origin": origin, "destination": dest, "mode": "driving", "key": api_key}
-                    drive_data = self._fetch_route(base_url, drive_params)
+                    drive_data = self._fetch_route(client, base_url, drive_params)
                     if drive_data:
                         best_route = {**drive_data, "mode": "driving"}
 
