@@ -2,6 +2,7 @@ import os
 import gradio as gr
 from dotenv import load_dotenv
 from crewai import Agent, Task, Crew
+from datetime import datetime, timedelta 
 
 import warnings
 warnings.filterwarnings("ignore", category=ResourceWarning)
@@ -112,6 +113,10 @@ writer_agent = Agent(
 
 # Core logic
 def generate_itinerary(location, start_date, end_date, preferences, transport_modes ):
+    if hasattr(start_date, "date"):
+        start_date = start_date.date().isoformat()
+    if hasattr(end_date, "date"):
+        end_date = end_date.date().isoformat()
     days, date_list = expand_dates(start_date, end_date)
     trip_duration_days = days
     
@@ -290,8 +295,8 @@ with gr.Blocks(theme=gr.themes.Soft()) as demo:
         )
 
     with gr.Row():
-        start_date = gr.Textbox(label="Start Date (YYYY-MM-DD)")
-        end_date = gr.Textbox(label="End Date (YYYY-MM-DD)")
+        start_date = gr.DateTime(label="Start Date", include_time=False, type="datetime")
+        end_date = gr.DateTime(label="End Date", include_time=False, type="datetime")
     
     preferences = gr.Textbox(label="Your Preferences", placeholder="art, local food, relaed pace, avoid queues")
 
