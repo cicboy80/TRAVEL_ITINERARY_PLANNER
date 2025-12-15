@@ -116,6 +116,7 @@ writer_agent = Agent(
 # Core logic
 def generate_itinerary(location, start_date, end_date, preferences, transport_modes ):
     print("✅ Button clicked:", location, start_date, end_date, transport_modes, preferences)
+    return "✅ UI is wired correctly — now running the crew..."
     if isinstance(start_date, str):
         start_date = start_date.replace("/", "-")
         start_date = datetime.fromisoformat(start_date).date().isoformat()
