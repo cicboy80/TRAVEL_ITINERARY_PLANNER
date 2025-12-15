@@ -323,12 +323,13 @@ with gr.Blocks(theme=gr.themes.Soft()) as demo:
         outputs=[itinerary_markdown]
     )
 
-demo.queue(concurrency_count=1, max_size=20)
+demo.queue(default_concurrency_limit=1, max_size=20)
 
 if __name__ == "__main__":
     demo.launch(
         server_name="0.0.0.0",
         server_port=7860,
         show_error=True,
+        max_threads=1,
         ssr_mode=False,   # <- important: SSR is experimental
     )
