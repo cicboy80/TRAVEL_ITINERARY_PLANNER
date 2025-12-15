@@ -6,7 +6,7 @@ import time
 import random
 from utils.cache import SQLiteCache
 
-cache = SQLiteCache("cache.sqlite")
+cache = SQLiteCache("tmp/cache.sqlite")
 
 class RoutePlannerTool(BaseTool):
     """

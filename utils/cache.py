@@ -1,12 +1,13 @@
 # utils/cache.py
 import json, sqlite3, time
 import threading
+from contextlib import contextmanager
 from typing import Any, Optional
 
 class SQLiteCache:
     def __init__(
         self, 
-        path: str = "cache.sqlite",
+        path: str = "/tmp/cache.sqlite",
         default_ttl_seconds: int = 3600,
         sqlite_timeout_seconds: int = 10,
         busy_timeout_ms: int = 5000,
@@ -26,6 +27,7 @@ class SQLiteCache:
             con.execute("PRAGMA journal_mode=WAL;")
             con.execute("PRAGMA synchronous=NORMAL;")
         con.execute(f"PRAGMA busy_timeout={self.busy_timeout_ms};")
+        return con
 
     def _init_db(self):
         with self._connect() as con:
@@ -40,7 +42,7 @@ class SQLiteCache:
 
     def get(self, key: str) -> Optional[Any]:
         now = int(time.time())
-        with self.connect() as con:
+        with self._connect() as con:
             row = con.execute("SELECT v, expires_at FROM cache WHERE k=?", (key,)).fetchone()
         if not row:
             return None
@@ -62,7 +64,7 @@ class SQLiteCache:
         payload = json.dumps(value)
 
         with self._lock:
-            with self.connect() as con:
+            with self._connect() as con:
                 con.execute(
                     "INSERT OR REPLACE INTO cache (k, v, expires_at) VALUES (?, ?, ?)",
                     (key, payload, expires_at)
@@ -71,7 +73,7 @@ class SQLiteCache:
 
     def delete(self, key: str) -> None:
         with self._lock:
-            with self.connect() as con:
+            with self._connect() as con:
                 con.execute("DELETE FROM cache WHERE k=?", (key,))
                 con.commit()
 

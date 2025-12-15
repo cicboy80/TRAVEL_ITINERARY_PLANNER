@@ -4,7 +4,7 @@ from typing import List, Dict, Optional
 from crewai.tools import BaseTool
 from utils.cache import SQLiteCache
 
-cache = SQLiteCache("cache.sqlite")
+cache = SQLiteCache("tmp/cache.sqlite")
 
 class GoogleMapsTool(BaseTool):
     """
