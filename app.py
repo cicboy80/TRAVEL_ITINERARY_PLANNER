@@ -277,7 +277,7 @@ def generate_itinerary(location, start_date, end_date, preferences, transport_mo
         trip_crew = Crew(
             agents=[retriever_agent, weather_agent, route_agent, planner_agent, writer_agent],
             tasks=[retrieval_task, weather_task, route_task, planning_task, writing_task],
-            verbose=False
+            verbose=True
         )
 
         result = trip_crew.kickoff(inputs = {
