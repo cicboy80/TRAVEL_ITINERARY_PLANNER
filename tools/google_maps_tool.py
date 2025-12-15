@@ -2,6 +2,9 @@ import os
 import httpx
 from typing import List, Dict, Optional
 from crewai.tools import BaseTool
+from utils.cache import SQLiteCache
+
+cache = SQLiteCache("cache.sqlite")
 
 class GoogleMapsTool(BaseTool):
     """
@@ -30,18 +33,25 @@ class GoogleMapsTool(BaseTool):
         all_results = {}
         with httpx.Client(timeout=15.0) as client:
             for category in categories:
+                cuisine = None
                 if category in ["breakfast", "lunch", "dinner"]:
                     cuisine = cuisine_preferences.get(category) if cuisine_preferences else None
                     query = f"{cuisine} {category} in {location}" if cuisine else f"{category} restaurants in {location}"
                 else:
                     query = f"{category} in {location}"
 
+                cache_key = f"places::{location.strip().lower()}::{category.strip().lower()}::{(cuisine or '').strip().lower()}"
+                cached = cache.get(cache_key)
+                if cached is not None:
+                    all_results[category] = cached
+                    continue
+
                 params = {"query": query, "key": api_key}
                 resp = client.get(base_url, params=params)
                 resp.raise_for_status()
                 data = resp.json()
 
-                all_results[category] = [
+                places = [
                     { 
                         "name": r.get("name"),
                         "category": category,
@@ -53,7 +63,9 @@ class GoogleMapsTool(BaseTool):
                         "place_id": r.get("place_id"),                                         
                     }
                     for r in data.get("results", [])[:max_results_per_query]
-
                 ]
+
+                all_results[category] = places
+                cache.set(cache_key, places, ttl_seconds=7 * 24 * 3600)
                
             return all_results

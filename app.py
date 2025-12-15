@@ -113,9 +113,16 @@ writer_agent = Agent(
 
 # Core logic
 def generate_itinerary(location, start_date, end_date, preferences, transport_modes ):
-    if hasattr(start_date, "date"):
+    if isinstance(start_date, str):
+        start_date = start_date.replace("/", "-")
+        start_date = datetime.fromisoformat(start_date).date().isoformat()
+    elif hasattr(start_date, "date"):
         start_date = start_date.date().isoformat()
-    if hasattr(end_date, "date"):
+    
+    if isinstance(end_date, str):
+        end_date = end_date.replace("/", "-")
+        end_date = datetime.fromisoformat(end_date).date().isoformat()
+    elif hasattr(end_date, "date"):
         end_date = end_date.date().isoformat()
     days, date_list = expand_dates(start_date, end_date)
     trip_duration_days = days
@@ -187,12 +194,13 @@ def generate_itinerary(location, start_date, end_date, preferences, transport_mo
             "   - reasoning (why chosen)\n"
             "   - weather_forecast (if applicable)\n"
             "   - distance_from_prev (km)\n"
-            "   - travel_duration_min (if applicable)\n\n"
+            "   - duration_minutes (if applicable)\n"
+            "   - travel_mode (optional)\n\n"
             "🔟 Output format (MUST match ItineraryModel exactly):\n"
             "{\n"
             '  "destination": "<city/region>",\n'
             '  "trip_duration_days": <int>,\n'
-            '  "transport_mode": ["walking", "public_transport", "driving", "cycling"],\n'
+            f'  "transport_modes": {transport_modes},\n'
             '  "start_date": "YYYY-MM-DD",\n'
             '  "end_date": "YYYY-MM-DD",\n'
             '  "traveler_profile": "<short preference summary>",\n'
@@ -212,6 +220,7 @@ def generate_itinerary(location, start_date, end_date, preferences, transport_mo
             '          "rating": <optional float>,\n'
             '          "reasoning": "<optional>",\n'
             '          "weather_forecast": "<optional>",\n'
+            '          "travel_mode": "<optional walking|public_transport|driving|cycling>",\n'
             '          "distance_from_prev": <optional float>,\n'
             '          "duration_minutes": <optional int>\n'
             "        }\n"
@@ -221,7 +230,7 @@ def generate_itinerary(location, start_date, end_date, preferences, transport_mo
             '  "total_distance_km": <optional float>,\n'
             '  "notes": "<optional>"\n'
             "}\n"
-            "⚠️ Use field name 'activities' (NOT events). Use 'duration_minutes' (NOT travel_duration_min)."
+            "⚠️ Use field name 'activities' (NOT events). Use 'duration_minutes' (NOT travel_duration_min). Use 'transport_modes' (NOT transport_mode)."
         ),
         expected_output="A structured JSON itinerary with complete metadata and travel-aware timestamps for each activity.",
         context=[retrieval_task, weather_task, route_task],
@@ -262,7 +271,7 @@ def generate_itinerary(location, start_date, end_date, preferences, transport_mo
     trip_crew = Crew(
         agents=[retriever_agent, weather_agent, route_agent, planner_agent, writer_agent],
         tasks=[retrieval_task, weather_task, route_task, planning_task, writing_task],
-        verbose=True
+        verbose=False
     )
 
     result = trip_crew.kickoff(inputs = {
