@@ -1,5 +1,7 @@
 import os
 import gradio as gr
+import traceback
+import json
 from dotenv import load_dotenv
 from crewai import Agent, Task, Crew
 from datetime import datetime, timedelta 
@@ -113,6 +115,7 @@ writer_agent = Agent(
 
 # Core logic
 def generate_itinerary(location, start_date, end_date, preferences, transport_modes ):
+    print("✅ Button clicked:", location, start_date, end_date, transport_modes, preferences)
     if isinstance(start_date, str):
         start_date = start_date.replace("/", "-")
         start_date = datetime.fromisoformat(start_date).date().isoformat()
@@ -131,6 +134,7 @@ def generate_itinerary(location, start_date, end_date, preferences, transport_mo
         transport_modes = [transport_modes]
     
     transport_modes_str = ", ".join(transport_modes)
+    modes_json = json.dumps(transport_modes)
 
     #Define the tasks
 
@@ -200,7 +204,7 @@ def generate_itinerary(location, start_date, end_date, preferences, transport_mo
             "{\n"
             '  "destination": "<city/region>",\n'
             '  "trip_duration_days": <int>,\n'
-            f'  "transport_modes": {transport_modes},\n'
+            f'  "transport_modes": {modes_json},\n'
             '  "start_date": "YYYY-MM-DD",\n'
             '  "end_date": "YYYY-MM-DD",\n'
             '  "traveler_profile": "<short preference summary>",\n'
@@ -278,7 +282,8 @@ def generate_itinerary(location, start_date, end_date, preferences, transport_mo
         "location": location,
         "start_date": start_date,
         "end_date": end_date,
-        "transport_modes": transport_modes_str,
+        "transport_modes": transport_modes,
+        "transport_modes_str": transport_modes_str,
         "trip_duration_days": trip_duration_days
     })
 
@@ -318,5 +323,12 @@ with gr.Blocks(theme=gr.themes.Soft()) as demo:
         outputs=[itinerary_markdown]
     )
 
+demo.queue(concurrency_count=1, max_size=20)
+
 if __name__ == "__main__":
-    demo.launch()
+    demo.launch(
+        server_name="0.0.0.0",
+        server_port=7860,
+        show_error=True,
+        ssr_mode=False,   # <- important: SSR is experimental
+    )
