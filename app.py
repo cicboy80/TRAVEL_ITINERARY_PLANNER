@@ -274,8 +274,9 @@ def maps_search_url(address: str, place_id: Optional[str] = None) -> str:
     return f"https://www.google.com/maps/search/?api=1&query={q}"
 
 # ----------------------------
-# Deterministic travel postprocess (THE FIX)
+# Helper functions
 # ----------------------------
+
 def choose_mode_for_leg(
     allowed_modes: List[str],
     matrix: Dict[str, Any],
@@ -302,32 +303,28 @@ def choose_mode_for_leg(
         except Exception:
             return None
 
-    # primary rule
     if "walking" in allowed_modes:
         d = get_dist("walking")
         if d is not None and d <= 2.0:
             return "walking"
 
-    if "public_transport" in allowed_modes:
-        if get_dur("public_transport") is not None:
-            return "public_transport"
+    if "public_transport" in allowed_modes and get_dur("public_transport") is not None:
+        return "public_transport"
 
-    if "cycling" in allowed_modes:
-        if get_dur("cycling") is not None:
-            return "cycling"
+    if "cycling" in allowed_modes and get_dur("cycling") is not None:
+        return "cycling"
 
-    if "driving" in allowed_modes:
-        if get_dur("driving") is not None:
-            return "driving"
+    if "driving" in allowed_modes and get_dur("driving") is not None:
+        return "driving"
 
-    # fallback: any available mode
     for m in ("walking", "public_transport", "cycling", "driving"):
         if m in allowed_modes and get_dur(m) is not None:
             return m
 
     return None
 
-def compute_leg_metrics(
+
+def compute_leg_metrics_from_matrix(
     routes: Dict[str, Any],
     allowed_modes: List[str],
     from_loc: str,
@@ -359,31 +356,136 @@ def compute_leg_metrics(
     if d is None or t is None:
         return (mode, None, None)
 
-    # duration_min is float; model wants int minutes
     return (mode, float(d), int(round(float(t))))
+
+def compute_leg_metrics_pairwise(
+    route_tool: RoutePlannerTool,
+    allowed_modes: List[str],
+    from_loc: str,
+    to_loc: str,
+) -> Tuple[Optional[str], Optional[float], Optional[int]]:
+    """
+    Pairwise fallback: calls RoutePlannerTool for a single leg (from -> to).
+    Handles RoutePlannerTool returning either a list or a dict.
+    """
+
+    try:
+        out = route_tool.run(
+            origin=from_loc,
+            destinations=[to_loc],
+            modes=allowed_modes,
+            max_results=1,
+            return_matrix=False,
+        )
+    except Exception:
+        return (None, None, None)
+
+    # ✅ Normalize output into `best` (a dict for the best leg/route)
+    if isinstance(out, dict):
+        # common patterns
+        if "routes" in out and isinstance(out["routes"], list) and out["routes"]:
+            best = out["routes"][0]
+        elif "results" in out and isinstance(out["results"], list) and out["results"]:
+            best = out["results"][0]
+        else:
+            best = out
+    elif isinstance(out, list) and out:
+        best = out[0]
+    else:
+        return (None, None, None)
+
+    # ✅ Extract fields (support a couple of common key names)
+    mode = best.get("mode") or best.get("travel_mode")
+    dist = best.get("distance_km") or best.get("distance")  # if your tool uses "distance"
+    dur = best.get("duration_min") or best.get("duration_minutes") or best.get("duration")
+
+    # ✅ Coerce types safely
+    try:
+        dist_km = float(dist) if dist is not None else None
+    except Exception:
+        dist_km = None
+
+    try:
+        dur_min = int(round(float(dur))) if dur is not None else None
+    except Exception:
+        dur_min = None
+
+    return (mode, dist_km, dur_min)
+
+def extract_unique_locations_in_order(itinerary: ItineraryModel) -> List[str]:
+    """
+    Unique activity locations in the order they appear across days.
+    """
+    seen = set()
+    out: List[str] = []
+    for day in itinerary.days:
+        for act in day.activities:
+            loc = (act.location or "").strip()
+            if loc and loc not in seen:
+                seen.add(loc)
+                out.append(loc)
+    return out
+
 
 def postprocess_itinerary(
     itinerary: ItineraryModel,
-    routes: Dict[str, Any],
+    route_tool: RoutePlannerTool,
     allowed_modes: List[str],
     origin: str,
     addr_to_meta: Dict[str, Dict[str, Any]],
+    prefer_single_matrix: bool = True,
+    nxn_destination_cap: int = 9,  # origin + 9 = 10 stops
 ) -> ItineraryModel:
     """
-    Overwrite travel fields deterministically from routes.matrix.
-    Also fill map_url from address/place_id.
+    Option A:
+    - Planner selects activities first
+    - Then we compute travel metrics
+      - If <= cap unique locations: single NxN matrix call
+      - Else: pairwise per-leg calls (still cached)
+
+    Always fills:
+    - act.map_url
+    - act.travel_mode, act.distance_from_prev, act.duration_minutes
+    - itinerary.total_distance_km
     """
     total_km = 0.0
 
+    # Fill map_url first (deterministic)
     for day in itinerary.days:
-        prev_loc = origin
-        for idx, act in enumerate(day.activities):
-            # Fill map_url deterministically
+        for act in day.activities:
             meta = addr_to_meta.get(act.location)
             act.map_url = maps_search_url(act.location, meta.get("place_id") if meta else None)
 
-            # Compute travel from prev_loc -> act.location
-            mode, dist_km, dur_min = compute_leg_metrics(routes, allowed_modes, prev_loc, act.location)
+    # Decide routing strategy
+    unique_locs = extract_unique_locations_in_order(itinerary)
+    use_matrix = prefer_single_matrix and (len(unique_locs) <= nxn_destination_cap)
+
+    routes: Dict[str, Any] = {}
+    if use_matrix:
+        destinations = unique_locs[:nxn_destination_cap]
+        routes = route_tool.run(
+            origin=origin,
+            destinations=destinations,
+            modes=allowed_modes,
+            max_results=len(destinations),
+            return_matrix=True,
+        )
+
+    # Now compute legs day-by-day in itinerary order
+    for day in itinerary.days:
+        prev_loc = origin
+        for act in day.activities:
+            if use_matrix:
+                mode, dist_km, dur_min = compute_leg_metrics_from_matrix(routes, allowed_modes, prev_loc, act.location)
+                # if matrix misses a leg (shouldn’t, but safe), fall back pairwise
+                if (mode is None) or (dist_km is None) or (dur_min is None):
+                    mode2, dist2, dur2 = compute_leg_metrics_pairwise(route_tool, allowed_modes, prev_loc, act.location)
+                    # only overwrite if pairwise gave something better
+                    if mode2 is not None: mode = mode2
+                    if dist_km is None: dist_km = dist2
+                    if dur_min is None: dur_min = dur2
+            else:
+                mode, dist_km, dur_min = compute_leg_metrics_pairwise(route_tool, allowed_modes, prev_loc, act.location)
 
             act.travel_mode = mode
             act.distance_from_prev = dist_km
@@ -396,18 +498,16 @@ def postprocess_itinerary(
 
     itinerary.total_distance_km = round(total_km, 2)
 
-    # Optional: add a deterministic note if any locations weren't in stops
-    stops = set(routes.get("stops") or [])
-    missing = []
-    for day in itinerary.days:
-        for act in day.activities:
-            if act.location not in stops:
-                missing.append(act.location)
-    if missing:
-        msg = f"Some activity locations were not in the route stops list, so travel metrics could not be computed for them: {missing[:5]}"
+    # Note if we had to use pairwise due to size
+    if not use_matrix and len(unique_locs) > nxn_destination_cap:
+        msg = (
+            f"Routing note: itinerary contains {len(unique_locs)} unique locations; "
+            f"computed travel metrics using per-leg routing (matrix cap is {nxn_destination_cap} destinations)."
+        )
         itinerary.notes = (itinerary.notes + "\n" + msg) if itinerary.notes else msg
 
     return itinerary
+
 
 # ----------------------------
 # Agents (LLM-only)
@@ -471,6 +571,7 @@ def generate_itinerary(location, start_date, end_date, preferences, transport_mo
         # Make places compact + deterministic
         places_compact = compact_places(places_raw, per_cat=6)
         candidates = flatten_candidates(places_compact)
+        addr_to_meta = place_lookup(places_compact)
 
         # --------------------
         # 2) Python: Weather (once)
@@ -501,23 +602,6 @@ def generate_itinerary(location, start_date, end_date, preferences, transport_mo
         # split into meal lists + activity list (still preference-driven)
         bundle = split_ranked_by_meals(ranked, k_meal=4, k_activity=10)
 
-        # Build allowed locations (<= 9 destinations for NxN matrix safety)
-        allowed_locations = build_allowed_locations(bundle, max_destinations=9)
-
-        # --------------------
-        # 4) Python: Route (once) — NxN over origin + allowed_locations
-        # --------------------
-        routes = route_tool.run(
-            origin=location,
-            destinations=allowed_locations,
-            modes=transport_modes,
-            max_results=10,
-            return_matrix=True,
-        )
-
-        # Lookup metadata by address (for map_url / ratings etc.)
-        addr_to_meta = place_lookup(places_compact)
-
         # --------------------
         # 5) LLM: Planner (no tools) — compact deterministic context
         # --------------------
@@ -535,20 +619,16 @@ def generate_itinerary(location, start_date, end_date, preferences, transport_mo
                 "activities": bundle["activities"],
             },
             "weather": weather_by_date,
-            "routes": {
-                # Planner only needs the deterministic allowed list.
-                # Travel fields will be computed in Python from matrix after.
-                "stops": routes.get("stops"),
-                "modes_requested": routes.get("modes_requested"),
-            },
             "RULES": [
                 "Use ONLY the provided places lists. Never invent new places.",
                 "Each activity.location MUST be exactly one of the provided place addresses (verbatim).",
                 "You must produce exactly trip_duration_days day-plans, matching the date range.",
                 "Keep each day within 08:00–22:00.",
                 "Use weather to bias indoor vs outdoor choices (rain -> museums/indoor).",
-                "Do not worry about distance/time fields; Python will compute travel metrics.",
+                "Do not worry about distance/time fields; Python will compute travel metrics after planning.",
                 "Still output travel_mode/distance_from_prev/duration_minutes fields (can be null).",
+                # IMPORTANT for Option A + matrix efficiency (even though we have pairwise fallback):
+                "Prefer <= 9 unique locations total across the itinerary to keep routing efficient.",
             ],
         }
 
@@ -587,10 +667,12 @@ def generate_itinerary(location, start_date, end_date, preferences, transport_mo
         # --------------------
         itinerary = postprocess_itinerary(
             itinerary=itinerary,
-            routes=routes,
+            route_tool=route_tool,
             allowed_modes=transport_modes,
             origin=location,
             addr_to_meta=addr_to_meta,
+            prefer_single_matrix=True,   # will use NxN when possible
+            nxn_destination_cap=9,       # origin + 9 = 10 stops
         )
 
         itinerary_json = itinerary.model_dump()
@@ -607,7 +689,8 @@ def generate_itinerary(location, start_date, end_date, preferences, transport_mo
                 "- Use a header per day.\n"
                 "- Bold timestamps.\n"
                 "- Include rating inline when present (⭐ 4.7).\n"
-                "- Include travel line when present: '*Travel to next: 12-minute walk, 1.1 km*'.\n"
+                "- For each day: include a travel line for every activity *except the first activity of that day*.\n"
+                "- Travel line format (exactly): *Travel from previous: {duration_minutes} min, {distance_from_prev} km ({travel_mode})*\n"
                 "- Only describe places in the JSON.\n"
             ),
             expected_output="Markdown itinerary.",
