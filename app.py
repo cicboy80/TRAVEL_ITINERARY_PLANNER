@@ -6,6 +6,7 @@ import time
 from dotenv import load_dotenv
 from crewai import Agent, Task, Crew
 from datetime import datetime, timedelta 
+from typing import Any, List, Optional
 
 import warnings
 warnings.filterwarnings("ignore", category=ResourceWarning)
