@@ -163,9 +163,14 @@ def generate_itinerary(location, start_date, end_date, preferences, transport_mo
                 f"- origin: '{location}'\n"
                 f"- destinations: <that list>\n"
                 f"- modes: {transport_modes}\n"
-                f"Return the tool output as JSON."
+                f"- return_matrix: true\n"
+                f"Return ONLY the tool output as valid JSON (no extra commentary)."
             ),
-            expected_output="A JSON list of routes with mode, distance_km, duration_min, destination.",
+            expected_output=(
+                "A single JSON object with keys: "
+                "'stops' (list), 'modes_requested' (list), 'origin_routes' (list of routes), "
+                "and 'matrix' (per-mode NxN distance_km/duration_min matrices)."
+            ),
             agent=route_agent,
             context=[retrieval_task]
         )
@@ -181,11 +186,37 @@ def generate_itinerary(location, start_date, end_date, preferences, transport_mo
                 "If heavy rain or extreme temperatures are forecast, prioritize indoor attractions or museums.\n"
                 "3️⃣ For each category (breakfast, lunch, dinner, activities), call the Semantic Ranking Tool to identify the best matches "
                 "from the places retrieved by the RetrieverTask. Use the user's preferences to compute semantic similarity and select top results.\n"
-                "4️⃣ Use the route and distance data (from RouteTask) to minimize total travel time between selected locations "
-                "and determine approximate travel times between locations by considering the user's selected transport modes "
-                "(walking, public_transport, or driving). Use walking for short distances (<2km) and public transport for longer ones.\n"
+
+                "4️⃣ Use the route and distance data (from RouteTask) to minimize total travel time.\n"
+                "   IMPORTANT: RouteTask returns BOTH:\n"
+                "   - origin_routes: origin → each stop (useful for first hop)\n"
+                "   - stops + matrix: an NxN matrix for true inter-stop travel times\n\n"
+                "   How to use the matrix correctly:\n"
+                "   A) Read RouteTask JSON:\n"
+                "      - stops = RouteTask.stops (list of stop strings)\n"
+                "      - matrix = RouteTask.matrix (dict keyed by mode)\n"
+                "   B) Build an index map once: idx = { stops[i]: i for i in range(len(stops)) }\n"
+                "   C) Matching rule (critical): Each activity 'location' MUST be exactly one of the strings in RouteTask.stops "
+                "(verbatim), so the index lookup works. Do NOT invent combined locations. "
+                "If you want to mention two nearby landmarks, create two separate activities with their own stop locations.\n"
+                "   D) For each pair of consecutive itinerary activities A -> B:\n"
+                "      - Find i = idx[A.location] and j = idx[B.location]\n"
+                "      - Choose travel mode as follows:\n"
+                "         • If walking is allowed AND matrix['walking'].distance_km[i][j] <= 2.0 → use walking\n"
+                "         • Else if public_transport is allowed → use public_transport\n"
+                "         • Else if cycling is allowed → use cycling\n"
+                "         • Else use driving\n"
+                "      - Then set travel metadata using the matrix (NOT guesses):\n"
+                "         • distance_from_prev = matrix[chosen_mode].distance_km[i][j]\n"
+                "         • duration_minutes  = matrix[chosen_mode].duration_min[i][j]\n"
+                "         • travel_mode       = chosen_mode\n"
+                "   E) For the first activity of the day:\n"
+                "      - Use origin_routes if provided, OR treat the origin as the previous stop only if it is included in stops.\n"
+                "   Always use the matrix for inter-stop travel times (not origin_routes).\n"
+
                 "5️⃣ **Adjust activity timestamps dynamically based on route durations.**\n"
-                "   - After computing routes, calculate cumulative travel time between activities.\n"
+                "   - After computing routes, calculate cumulative travel time between activities using:\n"
+                "     matrix[travel_mode].duration_min[i][j] between consecutive selected stops.\n"
                 "   - If travel between two events exceeds 20 minutes, delay the next event’s start time accordingly.\n"
                 "   - Ensure total daily schedule remains within 08:00–22:00. If an activity exceeds this range, reschedule or drop the lowest-ranked one.\n"
                 "6️⃣ Assign realistic timestamps to each event (e.g., breakfast 8:00–9:00, lunch 13:00–14:00, "
@@ -196,12 +227,12 @@ def generate_itinerary(location, start_date, end_date, preferences, transport_mo
                 "   - name\n"
                 "   - category\n"
                 "   - start_time, end_time\n"
-                "   - location (address)\n"
+                "   - location (address) (MUST be verbatim from RouteTask.stops)\n"
                 "   - rating (if available)\n"
                 "   - reasoning (why chosen)\n"
                 "   - weather_forecast (if applicable)\n"
                 "   - distance_from_prev (km)\n"
-                "   - duration_minutes (if applicable)\n"
+                "   - duration_minutes (from matrix)\n"
                 "   - travel_mode (optional)\n\n"
                 "🔟 Output format (MUST match ItineraryModel exactly):\n"
                 "{\n"
@@ -237,7 +268,7 @@ def generate_itinerary(location, start_date, end_date, preferences, transport_mo
                 '  "total_distance_km": <optional float>,\n'
                 '  "notes": "<optional>"\n'
                 "}\n"
-                "⚠️ Use field name 'activities' (NOT events). Use 'duration_minutes' (NOT travel_duration_min). Use 'transport_modes' (NOT transport_mode)."
+                " Use field name 'activities' (NOT events). Use 'duration_minutes' (NOT travel_duration_min). Use 'transport_modes' (NOT transport_mode)."
             ),
             expected_output="A structured JSON itinerary with complete metadata and travel-aware timestamps for each activity.",
             context=[retrieval_task, weather_task, route_task],

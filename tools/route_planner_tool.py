@@ -9,12 +9,19 @@ from utils.cache import SQLiteCache
 
 cache = SQLiteCache("/tmp/cache.sqlite")
 
+
 class RoutePlannerToolSchema(BaseModel):
     model_config = ConfigDict(extra="ignore")
     origin: str
     destinations: List[str]
     modes: Union[str, List[str]] = Field(default="walking")
     max_results: int = Field(default=10, ge=1, le=50)
+
+    # Optional NxN matrix output
+    return_matrix: bool = Field(
+        default=False,
+        description="If true, also return an NxN distance/duration matrix over [origin] + destinations."
+    )
 
     @field_validator("origin", mode="before")
     @classmethod
@@ -39,7 +46,7 @@ class RoutePlannerToolSchema(BaseModel):
 
             if len(s) > 300 and not (s.startswith("[") and s.endswith("]")):
                 return []
-            
+
             if s.startswith("[") and s.endswith("]"):
                 try:
                     s_json = s.replace("'", '"')
@@ -73,11 +80,11 @@ class RoutePlannerToolSchema(BaseModel):
                 else:
                     flat.append(x)
             v = flat
-        
+
         # If already a list sanitize items
         if not isinstance(v, list):
             return v
-        
+
         out: List[str] = []
         for item in v:
             if item is None:
@@ -87,7 +94,7 @@ class RoutePlannerToolSchema(BaseModel):
                     item.get("formatted_address")
                     or item.get("address")
                     or item.get("name")
-                    or""
+                    or ""
                 )
             else:
                 s = item
@@ -108,11 +115,11 @@ class RoutePlannerToolSchema(BaseModel):
 
         if v is None:
             return "walking"
-        
+
         if isinstance(v, str):
             s = v.strip()
             # handle stringified list like '["walking","public_transport"]' or "['walking','public_transport']"
-            if (s.startswith("[") and s.endswith("]")):
+            if s.startswith("[") and s.endswith("]"):
                 try:
                     s_json = s.replace("'", '"')
                     parsed = json.loads(s_json)
@@ -124,8 +131,9 @@ class RoutePlannerToolSchema(BaseModel):
 
         if isinstance(v, list):
             return [str(x).strip() for x in v if x is not None]
-        
+
         return "walking"
+
 
 class RoutePlannerTool(BaseTool):
     """
@@ -137,23 +145,24 @@ class RoutePlannerTool(BaseTool):
     description: str = (
         "Computes walking, public transport, cycling, or driving routes between locations. "
         "Uses Google Distance Matrix for speed. Automatically selects walking for short distances (<2km) "
-        "and public transport for longer trips if both modes are provided."
+        "and public transport for longer trips if both modes are provided. "
+        "Optionally returns an NxN matrix over [origin] + destinations."
     )
 
     args_schema = RoutePlannerToolSchema
 
     def _distance_matrix(
-            self,
-            client: httpx.Client,
-            origin: str,
-            destinations: List[str],
-            mode: str,
-            api_key: str
+        self,
+        client: httpx.Client,
+        origins: List[str],
+        destinations: List[str],
+        mode: str,
+        api_key: str
     ) -> Dict[str, Any]:
-        """Call Google Distance Matrix for origin -> multiple destinations in one request."""
+        """Call Google Distance Matrix for origins -> destinations in one request."""
         url = "https://maps.googleapis.com/maps/api/distancematrix/json"
         params = {
-            "origins": origin,
+            "origins": "|".join(origins),
             "destinations": "|".join(destinations),
             "mode": mode,
             "key": api_key,
@@ -161,72 +170,94 @@ class RoutePlannerTool(BaseTool):
         if mode == "transit":
             params["departure_time"] = int(time.time())
 
-        # cache key (transit depends on time bucket)
-        origin_k = origin.strip().lower()
-        dests_k = "|".join([d.strip().lower() for d in destinations])
+        # ---- cache key (transit depends on time bucket) ----
+        origins_k = "|".join(o.strip().lower() for o in origins)
+        dests_k = "|".join(d.strip().lower() for d in destinations)
         mode_k = mode.strip().lower()
 
         dep_bucket = ""
         if mode_k == "transit":
-            dep_bucket = f"t{int(time.time() // 900)}" #15 min bucket
+            dep_bucket = f"t{int(time.time() // 900)}"  # 15 min bucket
 
-        cache_key = f"distmat::{origin_k}::{mode_k}::{dests_k}"
+        cache_key = f"distmat::{mode_k}::{origins_k}::{dests_k}"
         if dep_bucket:
             cache_key = f"{cache_key}::{dep_bucket}"
 
         cached = cache.get(cache_key)
         if cached is not None:
             return cached
-        
+
         r = client.get(url, params=params, timeout=20.0)
         r.raise_for_status()
         data = r.json()
 
-        if data.get("status") != "OK":
-            status = data.get("status")
+        # clean status/error handling 
+        status = data.get("status")
+        if status != "OK":
             err = data.get("error_message", "")
             raise RuntimeError(f"DistanceMatrix status={status}: {err}")
 
         # TTL: transit is short-lived; others are longer
         ttl = 30 * 60 if mode_k == "transit" else 24 * 3600
         cache.set(cache_key, data, ttl_seconds=ttl)
-        return data  
+        return data
+
+    def _parse_nxn(self, dm: Dict[str, Any]) -> Dict[str, Any]:
+        """Convert a Distance Matrix response into NxN matrices (km/min), with None where not OK."""
+        rows = dm.get("rows", [])
+        dist_km: List[List[Optional[float]]] = []
+        dur_min: List[List[Optional[float]]] = []
+
+        for r in rows:
+            elems = r.get("elements", [])
+            drow: List[Optional[float]] = []
+            trow: List[Optional[float]] = []
+
+            for el in elems:
+                if el.get("status") == "OK":
+                    drow.append(round(el["distance"]["value"] / 1000, 2))
+                    trow.append(round(el["duration"]["value"] / 60, 1))
+                else:
+                    drow.append(None)
+                    trow.append(None)
+
+            dist_km.append(drow)
+            dur_min.append(trow)
+
+        return {"distance_km": dist_km, "duration_min": dur_min}
 
     def _run(
         self,
         origin: str,
         destinations: List[str],
         modes: Union[str, List[str]] = "walking",
-        max_results: int = 10
-    ) -> List[Dict[str, Union[str, float]]]:
+        max_results: int = 10,
+        return_matrix: bool = False,  # ✅ NEW
+    ) -> Union[List[Dict[str, Union[str, float]]], Dict[str, Any]]:
         """
         Calculates travel routes between a starting location and multiple destinations.
 
-        Args:
-            origin (str): Starting location name or address.
-            destinations (List[str]): List of destinations to route to.
-            modes (str or List[str]): One or multiple transport modes ('walking', 'driving', 'public_transport').
-            max_results (int): Max number of routes to compute.
-
         Returns:
-            List[Dict]: A list of dictionaries with mode, distance_km, duration_min, and destination.
+          - default: List[Dict] (same as before)
+          - if return_matrix=True: Dict with stops + origin_routes + matrix
         """
-
         api_key = os.getenv("GOOGLE_MAPS_API_KEY")
         if not api_key:
             raise ValueError("Missing GOOGLE_MAPS_API_KEY in environment variables")
 
+        # allow stringified lists
         if isinstance(modes, str) and modes.strip().startswith("["):
             try:
                 modes = json.loads(modes.replace("'", '"'))
             except Exception:
                 pass
 
-        if isinstance(modes,str):
+        if isinstance(modes, str):
             modes_list = [modes.strip()]
         else:
             modes_list = [str(m).strip() for m in modes if m is not None]
 
+        # normalize mode labels
         norm_modes: List[str] = []
         for m in modes_list:
             if m == "public_transport":
@@ -236,30 +267,31 @@ class RoutePlannerTool(BaseTool):
             else:
                 norm_modes.append(m)
 
-        # sanitize
-        norm_modes = [m for m in norm_modes if m]
+        norm_modes = [m for m in norm_modes if m]  # sanitize
 
         # Destination list
         MAX_DM_DESTS = 25
         dests = [str(d).strip() for d in destinations if str(d).strip()][:min(max_results, MAX_DM_DESTS)]
         if not dests:
-            return []
+            return [] if not return_matrix else {"stops": [origin], "origin_routes": [], "matrix": {}}
+
+        # NxN matrix safety: Distance Matrix elements = origins*destinations (cap ~100)
+        # => stops_total <= 10 keeps NxN <= 100
+        MAX_STOPS_FOR_NXN = 10
 
         with httpx.Client(timeout=20.0) as client:
+            # 1) origin -> dests (1xN) per requested mode
             dm_by_mode: Dict[str, Dict[str, Any]] = {}
-
-            # call each requested mode once
             for m in ("walking", "transit", "driving", "bicycling"):
                 if m in norm_modes:
-                    dm_by_mode[m] = self._distance_matrix(client, origin, dests, m, api_key)
+                    dm_by_mode[m] = self._distance_matrix(client, [origin], dests, m, api_key)
 
             results: List[Dict[str, Union[str, float]]] = []
 
-            # Distance matrix rows[0].elements alighns with destination array
+            # Distance matrix rows[0].elements aligns with destination array
             for i, dest in enumerate(dests):
                 best: Optional[Dict[str, Union[str, float]]] = None
 
-                # Helper to extract one element
                 def get_el(mode: str) -> Optional[Dict[str, Any]]:
                     dm = dm_by_mode.get(mode)
                     if not dm:
@@ -273,23 +305,19 @@ class RoutePlannerTool(BaseTool):
                 # Try walking first
                 el_walk = get_el("walking")
                 if el_walk:
-                    walk_km = round(el_walk["distance"]["value"] / 1000, 2)
-                    walk_min = round(el_walk["duration"]["value"] / 60, 1)
                     best = {
                         "mode": "walking",
-                        "distance_km": walk_km,
-                        "duration_min": walk_min,
+                        "distance_km": round(el_walk["distance"]["value"] / 1000, 2),
+                        "duration_min": round(el_walk["duration"]["value"] / 60, 1),
                     }
 
                 # Try public transport if walking route > 2km or not available
                 el_transit = get_el("transit")
                 if el_transit and (best is None or float(best["distance_km"]) > 2.0):
-                    tr_km = round(el_transit["distance"]["value"] / 1000, 2)
-                    tr_min = round(el_transit["duration"]["value"] / 60, 1)
                     cand = {
                         "mode": "public_transport",
-                        "distance_km": tr_km,
-                        "duration_min": tr_min,
+                        "distance_km": round(el_transit["distance"]["value"] / 1000, 2),
+                        "duration_min": round(el_transit["duration"]["value"] / 60, 1),
                     }
                     if best is None or float(cand["duration_min"]) < float(best["duration_min"]):
                         best = cand
@@ -299,13 +327,34 @@ class RoutePlannerTool(BaseTool):
                     for fallback_mode, label in (("bicycling", "cycling"), ("driving", "driving")):
                         el = get_el(fallback_mode)
                         if el:
-                            km = round(el["distance"]["value"] / 1000, 2)
-                            mn = round(el["duration"]["value"] / 60, 1)
-                            best = {"mode": label, "distance_km": km, "duration_min": mn}
+                            best = {
+                                "mode": label,
+                                "distance_km": round(el["distance"]["value"] / 1000, 2),
+                                "duration_min": round(el["duration"]["value"] / 60, 1),
+                            }
                             break
 
                 if best:
                     best["destination"] = dest
-                    results.append(best)              
-                
-            return results
+                    results.append(best)
+
+            # 2) Optional: NxN matrix over [origin] + destinations (still within this single tool run)
+            if not return_matrix:
+                return results
+
+            stops = [origin] + dests
+            if len(stops) > MAX_STOPS_FOR_NXN:
+                stops = stops[:MAX_STOPS_FOR_NXN]  # origin + first 9 destinations
+
+            nxn_by_mode: Dict[str, Any] = {}
+            for m in ("walking", "transit", "driving", "bicycling"):
+                if m in norm_modes:
+                    dm_nxn = self._distance_matrix(client, stops, stops, m, api_key)
+                    nxn_by_mode[m] = self._parse_nxn(dm_nxn)
+
+            return {
+                "stops": stops,
+                "modes_requested": norm_modes,
+                "origin_routes": results,
+                "matrix": nxn_by_mode,
+            }
