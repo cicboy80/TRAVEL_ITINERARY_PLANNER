@@ -1,12 +1,132 @@
 import os
 import httpx
-from typing import List, Dict, Union, Optional
+from typing import List, Dict, Union, Optional, Any
 from crewai.tools import BaseTool
+from pydantic import BaseModel, Field, field_validator, ConfigDict
 import time
 import random
+import json
 from utils.cache import SQLiteCache
 
 cache = SQLiteCache("/tmp/cache.sqlite")
+
+class RoutePlannerToolSchema(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    origin: str
+    destinations: List[str]
+    modes: Union[str, List[str]] = Field(default="walking")
+    max_results: int = Field(default=10, ge=1, le=50)
+
+    @field_validator("origin", mode="before")
+    @classmethod
+    def normalize_origin(cls, v: Any):
+        if isinstance(v, dict):
+            v = v.get("origin") or v.get("value") or v.get("description") or ""
+        return str(v).strip()
+
+    @field_validator("destinations", mode="before")
+    @classmethod
+    def normalize_destinations(cls, v: Any):
+        # unwrap common CrewAI/LLM shapes
+        if isinstance(v, dict):
+            if "destinations" in v:
+                v = v["destinations"]
+            elif "description" in v:
+                v = v["description"]
+
+        # Accept messy inputs from the LLM and coerce to list[str]
+        if isinstance(v, str):
+            s = v.strip()
+
+            if len(s) > 300 and not (s.startswith("[") and s.endswith("]")):
+                return []
+            
+            if s.startswith("[") and s.endswith("]"):
+                try:
+                    s_json = s.replace("'", '"')
+                    parsed = json.loads(s_json)
+                    if isinstance(parsed, list):
+                        v = parsed
+                    else:
+                        v = [s]
+                except Exception:
+                    v = [s]
+            else:
+                v = [s]
+
+        # If it's a dict, try common address/name fields
+        elif isinstance(v, dict):
+            s = (
+                v.get("formatted_address")
+                or v.get("address")
+                or v.get("name")
+                or ""
+            )
+            s = str(s).strip()
+            v = [s] if s else []
+
+        # if already a list, flatten nested lists
+        if isinstance(v, list):
+            flat: List[Any] = []
+            for x in v:
+                if isinstance(x, list):
+                    flat.extend(x)
+                else:
+                    flat.append(x)
+            v = flat
+        
+        # If already a list sanitize items
+        if not isinstance(v, list):
+            return v
+        
+        out: List[str] = []
+        for item in v:
+            if item is None:
+                continue
+            if isinstance(item, dict):
+                s = (
+                    item.get("formatted_address")
+                    or item.get("address")
+                    or item.get("name")
+                    or""
+                )
+            else:
+                s = item
+                
+            s = str(s).strip()
+            if not s or s.isdigit():
+                continue
+            out.append(s)
+
+        return out
+
+    @field_validator("modes", mode="before")
+    @classmethod
+    def normalize_modes(cls, v: Any):
+        # unwrap common CrewAI/LLM shapes
+        if isinstance(v, dict):
+            v = v.get("modes") or v.get("value") or v.get("description") or v
+
+        if v is None:
+            return "walking"
+        
+        if isinstance(v, str):
+            s = v.strip()
+            # handle stringified list like '["walking","public_transport"]' or "['walking','public_transport']"
+            if (s.startswith("[") and s.endswith("]")):
+                try:
+                    s_json = s.replace("'", '"')
+                    parsed = json.loads(s_json)
+                    if isinstance(parsed, list):
+                        return [str(x).strip() for x in parsed if x is not None]
+                except Exception:
+                    pass
+            return s
+
+        if isinstance(v, list):
+            return [str(x).strip() for x in v if x is not None]
+        
+        return "walking"
 
 class RoutePlannerTool(BaseTool):
     """
@@ -16,10 +136,12 @@ class RoutePlannerTool(BaseTool):
 
     name: str = "Route Planner Tool"
     description: str = (
-        "Computes walking, public transport, or driving routes between locations. "
+        "Computes walking, public transport, cycling, or driving routes between locations. "
         "Automatically selects walking for short distances (<2km) and public transport for longer trips "
         "if both modes are provided."
     )
+
+    args_schema = RoutePlannerToolSchema
 
     def _run(
         self,
@@ -45,14 +167,31 @@ class RoutePlannerTool(BaseTool):
         if not api_key:
             raise ValueError("Missing GOOGLE_MAPS_API_KEY in environment variables")
 
-        if isinstance(modes, str):
+        if isinstance(modes, str) and modes.strip().startswith("["):
+            try:
+                modes = json.loads(modes.replace("'", '"'))
+            except Exception:
+                pass
+
+        if isinstance(modes, list):
+            modes = [str(x).strip() for x in modes if x is not None]
+            modes = [m for m in modes if m]
+            modes = ["transit" if m == "public_transport" else m for m in modes]
+
+        if isinstance(modes,str):
             modes = [modes]
+
+        if not destinations:
+            return []
 
         base_url = "https://maps.googleapis.com/maps/api/directions/json"
         results = []
 
         with httpx.Client(timeout=20.0) as client:
             for dest in destinations[:max_results]:
+                dest = str(dest).strip()
+                if not dest:
+                    continue
                 best_route = None
 
                 # Try walking first
@@ -118,6 +257,8 @@ class RoutePlannerTool(BaseTool):
                 dep_bucket = f"t{departure_time}"
 
         key = f"route::{origin}::{dest}::{mode}::{transit_mode}"
+        if dep_bucket:
+            key = f"{key}::{dep_bucket}"
         
         cached = cache.get(key)
         if cached is not None:
@@ -136,7 +277,6 @@ class RoutePlannerTool(BaseTool):
                 data = response.json()
 
                 status = data.get("status", "")
-                routes = data.get("routes") or []
 
                 # transient: retry, don't negative-cache
                 if status in ("OVER_QUERY_LIMIT", "UNKNOWN_ERROR"):
@@ -163,7 +303,7 @@ class RoutePlannerTool(BaseTool):
                 cache.set(key, out, ttl_seconds=success_ttl)
                 return out
             
-            except (httpx.TimeoutException, httpx.NetworkError) as e:
+            except (httpx.TimeoutException, httpx.RequestError) as e:
                 print(f"Directions network/timeout (attempt {attempt+1}/3): {e}")
 
             except httpx.HTTPStatusError as e:
@@ -174,6 +314,10 @@ class RoutePlannerTool(BaseTool):
                 else:
                     print(f"Directions HTTP {code}: {e}")
                     return None
+            
+            except RuntimeError:
+                # REQUEST_DENIED / hard failures should surface immediately
+                raise
 
             except Exception as e:
                 print(f"Error fetching route (attempt {attempt+1}/3): {e}")
