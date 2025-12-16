@@ -1,96 +1,55 @@
+# app.py — Clean Fix 2 (Python tools first, deterministic planner context, Python travel postprocess)
+
 import os
-import gradio as gr
-import traceback
+import re
 import json
 import time
-import re
-from dotenv import load_dotenv
-from crewai import Agent, Task, Crew
+import traceback
+import urllib.parse
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
-import warnings
-warnings.filterwarnings("ignore", category=ResourceWarning)
+import gradio as gr
+from dotenv import load_dotenv
 
-# =========================
-# ENV
-# =========================
-load_dotenv()
+from crewai import Agent, Task, Crew
 
-print("🔍 GOOGLE_MAPS_API_KEY found:", bool(os.getenv("GOOGLE_MAPS_API_KEY")))
-print("🔍 OPENAI_API_KEY found:", bool(os.getenv("OPENAI_API_KEY")))
-
-os.environ["LITELLM_PROVIDER"] = "openai"
-os.environ["OPENAI_API_BASE"] = "https://api.openai.com/v1"
-
-# Disable tracing + avoid prompts (harmless if your CrewAI version ignores these)
-os.environ["CREWAI_TRACING_ENABLED"] = "false"
-os.environ["CREWAI_DISABLE_TRACES_PROMPT"] = "true"
-
-if not os.getenv("OPENAI_API_KEY"):
-    raise ValueError("Missing OPENAI_API_KEY")
-if not os.getenv("GOOGLE_MAPS_API_KEY"):
-    print("⚠️ Warning: Missing GOOGLE_MAPS_API_KEY")
-
-# =========================
-# IMPORTS (local)
-# =========================
 from tools.google_maps_tool import GoogleMapsTool
 from tools.route_planner_tool import RoutePlannerTool
 from tools.weather_tool import WeatherTool
 from tools.semantic_ranking_tool import SemanticRankingTool
+
 from models.itinerary_model import ItineraryModel
 from utils.date_utils import expand_dates
 
-# =========================
-# TOOLS (Python-called phase)
-# =========================
+# ----------------------------
+# Env
+# ----------------------------
+load_dotenv()
+os.environ["LITELLM_PROVIDER"] = "openai"
+os.environ["OPENAI_API_BASE"] = "https://api.openai.com/v1"
+
+print("🔍 GOOGLE_MAPS_API_KEY found:", bool(os.getenv("GOOGLE_MAPS_API_KEY")))
+print("🔍 OPENAI_API_KEY found:", bool(os.getenv("OPENAI_API_KEY")))
+
+if not os.getenv("OPENAI_API_KEY"):
+    raise ValueError("Missing OPENAI_API_KEY")
+if not os.getenv("GOOGLE_MAPS_API_KEY"):
+    raise ValueError("Missing GOOGLE_MAPS_API_KEY")
+
+# ----------------------------
+# Tools (Python-owned)
+# ----------------------------
 maps_tool = GoogleMapsTool()
 weather_tool = WeatherTool()
 route_tool = RoutePlannerTool()
-semantic_ranking_tool = SemanticRankingTool()
+semantic_tool = SemanticRankingTool()
 
-# =========================
-# AGENTS (LLM-only phase)
-# =========================
-planner_agent = Agent(
-    role="Senior Travel Agent",
-    goal=(
-        "Design a balanced daily itinerary using ONLY the provided CONTEXT_JSON. "
-        "Never invent places not present in the context."
-    ),
-    backstory=(
-        "A senior travel agent expert at building efficient, preference-matching itineraries with realistic timings."
-    ),
-    tools=[semantic_ranking_tool],
-    llm="gpt-5-mini",
-    temperature=0.3,
-    reasoning=False,
-    verbose=False,
-)
-
-writer_agent = Agent(
-    role="Itinerary Writer Agent",
-    goal="Turn the structured itinerary JSON into engaging Markdown without inventing new places.",
-    backstory="Professional travel writer, accurate and non-fictional.",
-    llm="gpt-4o-mini",
-    temperature=0.3,
-    verbose=False,
-)
-
-# =========================
-# HELPERS
-# =========================
-def normalize_date(d: Any) -> str:
-    if isinstance(d, str):
-        d = d.replace("/", "-")
-        return datetime.fromisoformat(d).date().isoformat()
-    if hasattr(d, "date"):
-        return d.date().isoformat()
-    raise ValueError(f"Unsupported date value: {d!r}")
-
-def preference_terms(preferences: str, cap: int = 12) -> List[str]:
-    """Turn free-text preferences into a clean list of query intents (no hardcoding of specific venues)."""
+# ----------------------------
+# Helpers (preferences)
+# ----------------------------
+def preference_terms(preferences: str) -> List[str]:
+    """Free-text -> list of preference terms (no hardcoding like 'bars')."""
     if not preferences:
         return []
     parts = re.split(r"[,\n;/|]+", preferences)
@@ -102,281 +61,566 @@ def preference_terms(preferences: str, cap: int = 12) -> List[str]:
         if k not in seen:
             seen.add(k)
             out.append(t)
-    return out[:cap]
+    return out[:12]
 
-def split_terms_for_maps(terms: List[str]) -> Tuple[List[str], Optional[Dict[str, str]]]:
+def extract_activity_terms(preferences: str, max_terms: int = 8) -> List[str]:
     """
-    Derive:
-      - activities: list[str] used as dynamic categories for GoogleMapsTool
-      - cuisine_preferences: optional mapping meal->query-text
-    No hardcoded "bars/craft beer" — we just route whatever the user wrote into queries.
+    Extract “activity-like” terms from preferences.
+    We avoid duplicating obvious meal intent tokens, but do NOT hardcode venues like bars.
     """
-    if not terms:
-        return [], None
+    if not preferences:
+        return []
+    raw: List[str] = []
+    for part in preferences.replace(";", ",").split(","):
+        term = part.strip()
+        if term:
+            raw.append(term)
 
-    meal_tokens = ("breakfast", "lunch", "dinner", "restaurant", "food", "cuisine")
-    activities = [t for t in terms if not any(tok in t.lower() for tok in meal_tokens)]
-    activities = activities[:8]
-
-    foodish_tokens = (
-        "food", "cuisine", "restaurant", "vegan", "vegetarian", "gluten",
-        "wine", "beer", "coffee", "bakery", "pasta", "pizza", "seafood"
-    )
-    food_terms = [t for t in terms if any(tok in t.lower() for tok in foodish_tokens)]
-    cuisine_text = ", ".join(food_terms).strip() if food_terms else None
-
-    cuisine_preferences = None
-    if cuisine_text:
-        # Your GoogleMapsTool expects Dict[str,str] keyed by meal category
-        cuisine_preferences = {"breakfast": cuisine_text, "lunch": cuisine_text, "dinner": cuisine_text}
-
-    return activities, cuisine_preferences
-
-def pick_address(item: Any, fallback_city: str) -> Optional[str]:
-    if isinstance(item, dict):
-        addr = (item.get("formatted_address") or item.get("address") or "").strip()
-        if addr:
-            return addr
-        name = (item.get("name") or "").strip()
-        return f"{name}, {fallback_city}".strip(", ") if name else None
-    s = str(item).strip()
-    return s if s else None
-
-def compact_places(maps_data: Dict[str, Any], per_cat: int = 6, max_cats: int = 14) -> Dict[str, List[Dict[str, Any]]]:
-    """
-    Output: { category: [ {name,address,rating,place_id,category,lat,lng,user_ratings_total}, ... ] }
-    Slim + stable for planner context.
-    """
-    if not isinstance(maps_data, dict):
-        return {}
-
-    # Normalize if tool returns {"restaurants": {...}, "landmarks":[...], ...}
-    if "restaurants" in maps_data and isinstance(maps_data["restaurants"], dict):
-        for k, v in maps_data["restaurants"].items():
-            if k not in maps_data:
-                maps_data[k] = v
-
-    out: Dict[str, List[Dict[str, Any]]] = {}
-    cat_count = 0
-    for cat, items in maps_data.items():
-        if cat_count >= max_cats:
-            break
-        if not isinstance(items, list):
+    # skip meal/food intent tokens (still not hardcoding venues)
+    skip_tokens = ("food", "restaurant", "cuisine", "breakfast", "lunch", "dinner", "eat", "eating")
+    out: List[str] = []
+    for t in raw:
+        tl = t.lower()
+        if any(tok in tl for tok in skip_tokens):
             continue
-        slim: List[Dict[str, Any]] = []
-        for r in items[:per_cat]:
-            if not isinstance(r, dict):
-                continue
-            slim.append({
-                "name": r.get("name"),
-                "address": r.get("address") or r.get("formatted_address"),
-                "rating": r.get("rating"),
-                "place_id": r.get("place_id"),
-                "category": r.get("category") or cat,
-                "lat": r.get("lat"),
-                "lng": r.get("lng"),
-                "user_ratings_total": r.get("user_ratings_total"),
-            })
-        if slim:
-            out[cat] = slim
-            cat_count += 1
+        if t not in out:
+            out.append(t)
+        if len(out) >= max_terms:
+            break
     return out
 
-def build_destinations_for_routes(places_by_cat: Dict[str, List[Dict[str, Any]]], location: str, cap: int = 12) -> List[str]:
+def to_iso_date(d: Any) -> str:
+    if isinstance(d, str):
+        s = d.replace("/", "-")
+        return datetime.fromisoformat(s).date().isoformat()
+    if hasattr(d, "date"):
+        return d.date().isoformat()
+    raise ValueError(f"Unsupported date value: {d!r}")
+
+# ----------------------------
+# Helpers (data shaping)
+# ----------------------------
+def compact_places(places_by_cat: Dict[str, List[Dict[str, Any]]], per_cat: int = 6) -> Dict[str, List[Dict[str, Any]]]:
     """
-    Deterministic: meals first, then preference-driven categories (in dict order).
-    Slightly >10 helps with “craft beer” appearing in the routeable stops if retrieved.
+    Keep only fields we need + cap count per category to keep planner context compact.
     """
-    dests: List[str] = []
-
-    def add_from(cat: str, n: int):
-        for item in places_by_cat.get(cat, [])[:n]:
-            addr = pick_address(item, location)
-            if addr:
-                dests.append(addr)
-
-    # Meals
-    add_from("breakfast", 2)
-    add_from("lunch", 2)
-    add_from("dinner", 2)
-
-    # Then everything else
-    for cat in places_by_cat.keys():
-        if cat in ("breakfast", "lunch", "dinner"):
+    out: Dict[str, List[Dict[str, Any]]] = {}
+    for cat, items in (places_by_cat or {}).items():
+        if not isinstance(items, list):
             continue
-        add_from(cat, 2)
-        if len(dests) >= cap:
+
+        # Sort roughly by "quality": rating desc, then user_ratings_total desc
+        def score(x: Dict[str, Any]) -> Tuple[float, int]:
+            r = x.get("rating") or 0.0
+            n = x.get("user_ratings_total") or 0
+            return (float(r), int(n))
+
+        items_sorted = sorted(items, key=score, reverse=True)[:per_cat]
+
+        cleaned: List[Dict[str, Any]] = []
+        for x in items_sorted:
+            addr = (x.get("address") or "").strip()
+            if not addr:
+                continue
+            cleaned.append(
+                {
+                    "name": (x.get("name") or "").strip(),
+                    "address": addr,
+                    "category": (x.get("category") or cat).strip(),
+                    "rating": x.get("rating"),
+                    "user_ratings_total": x.get("user_ratings_total"),
+                    "place_id": x.get("place_id"),
+                }
+            )
+        out[cat] = cleaned
+    return out
+
+def flatten_candidates(compact: Dict[str, List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
+    """
+    Build candidates list for semantic ranking tool.
+    Tool expects: name, category, description (we provide lightweight deterministic description).
+    """
+    cands: List[Dict[str, Any]] = []
+    for cat, items in compact.items():
+        for it in items:
+            nm = it.get("name")
+            addr = it.get("address")
+            if not nm or not addr:
+                continue
+            cands.append(
+                {
+                    "name": nm,
+                    "category": cat,
+                    "description": f"{cat} option at {addr}",
+                    "address": addr,
+                    "rating": it.get("rating"),
+                    "place_id": it.get("place_id"),
+                }
+            )
+    # de-dupe by address (preserve order)
+    seen = set()
+    out = []
+    for x in cands:
+        k = x["address"].lower()
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(x)
+    return out
+
+def semantic_rank(preferences: str, candidates: List[Dict[str, Any]], top_k: int = 30) -> List[Dict[str, Any]]:
+    if not preferences or not candidates:
+        return candidates[:top_k]
+    ranked = semantic_tool.run(
+        user_preferences=preferences,
+        candidates=[{"name": c["name"], "category": c["category"], "description": c["description"]} for c in candidates],
+        top_k=top_k,
+        distance_weight=0.0,
+    )
+    # ranked returns list[dict] with name/category/description/semantic_score
+    # reattach address/place_id/rating deterministically by name+category match, fallback to name match
+    by_key = {(c["name"], c["category"]): c for c in candidates}
+    by_name = {}
+    for c in candidates:
+        by_name.setdefault(c["name"], c)
+
+    out = []
+    for r in ranked:
+        k = (r.get("name"), r.get("category"))
+        c = by_key.get(k) or by_name.get(r.get("name"))
+        if not c:
+            continue
+        merged = dict(c)
+        merged["semantic_score"] = r.get("semantic_score")
+        out.append(merged)
+    return out[:top_k]
+
+def split_ranked_by_meals(
+    ranked: List[Dict[str, Any]],
+    meal_cats: Tuple[str, str, str] = ("breakfast", "lunch", "dinner"),
+    k_meal: int = 4,
+    k_activity: int = 10,
+) -> Dict[str, List[Dict[str, Any]]]:
+    meals = {m: [] for m in meal_cats}
+    activities: List[Dict[str, Any]] = []
+
+    for x in ranked:
+        cat = (x.get("category") or "").lower().strip()
+        if cat in meals and len(meals[cat]) < k_meal:
+            meals[cat].append(x)
+        elif cat not in meal_cats:
+            activities.append(x)
+
+    # diversify activities by category a bit
+    picked: List[Dict[str, Any]] = []
+    per_cat_cap = 2
+    per_cat_count: Dict[str, int] = {}
+
+    for x in activities:
+        cat = (x.get("category") or "").lower().strip() or "other"
+        if per_cat_count.get(cat, 0) >= per_cat_cap:
+            continue
+        picked.append(x)
+        per_cat_count[cat] = per_cat_count.get(cat, 0) + 1
+        if len(picked) >= k_activity:
             break
 
-    # De-dupe preserve order
-    seen = set()
-    out: List[str] = []
-    for d in dests:
-        if d not in seen:
-            seen.add(d)
-            out.append(d)
-    return out[:cap]
+    return {
+        "breakfast": meals["breakfast"],
+        "lunch": meals["lunch"],
+        "dinner": meals["dinner"],
+        "activities": picked,
+    }
 
-def slim_weather_for_context(weather_data: Any) -> Any:
+def build_allowed_locations(bundle: Dict[str, List[Dict[str, Any]]], max_destinations: int = 9) -> List[str]:
     """
-    Your WeatherTool returns:
-      { city, latitude, longitude, start_date, end_date, forecast_days, forecasts:[...] }
-    We shrink it to {YYYY-MM-DD:{temp_max,temp_min,precipitation_mm}} for lower token cost.
+    RoutePlannerTool NxN caps to 10 stops (origin + 9 destinations).
+    So we choose a compact allowed set for the planner to pick from.
     """
-    if isinstance(weather_data, dict) and isinstance(weather_data.get("forecasts"), list):
-        slim: Dict[str, Dict[str, Any]] = {}
-        for f in weather_data["forecasts"]:
-            if not isinstance(f, dict):
-                continue
-            dt = f.get("date")
-            if not dt:
-                continue
-            slim[dt] = {
-                "temp_max": f.get("temp_max"),
-                "temp_min": f.get("temp_min"),
-                "precipitation_mm": f.get("precipitation_mm"),
-            }
-        return slim
-    return weather_data
+    selected: List[str] = []
 
-def safe_json_dumps(obj: Any) -> str:
-    return json.dumps(obj, ensure_ascii=False, separators=(",", ":"), default=str)
+    def take(items: List[Dict[str, Any]], n: int):
+        nonlocal selected
+        for it in items[:n]:
+            addr = (it.get("address") or "").strip()
+            if addr and addr not in selected:
+                selected.append(addr)
 
-# =========================
-# CORE LOGIC (Fix 2)
-# =========================
+    # meals first (structure), then activities
+    take(bundle.get("breakfast", []), 2)
+    take(bundle.get("lunch", []), 2)
+    take(bundle.get("dinner", []), 2)
+    take(bundle.get("activities", []), 5)
+
+    return selected[:max_destinations]
+
+def place_lookup(compact: Dict[str, List[Dict[str, Any]]]) -> Dict[str, Dict[str, Any]]:
+    """Address -> place metadata."""
+    out: Dict[str, Dict[str, Any]] = {}
+    for cat, items in compact.items():
+        for it in items:
+            addr = (it.get("address") or "").strip()
+            if not addr:
+                continue
+            out[addr] = it
+    return out
+
+def maps_search_url(address: str, place_id: Optional[str] = None) -> str:
+    q = urllib.parse.quote_plus(address)
+    if place_id:
+        # Google Maps "search" url supports query_place_id
+        pid = urllib.parse.quote_plus(place_id)
+        return f"https://www.google.com/maps/search/?api=1&query={q}&query_place_id={pid}"
+    return f"https://www.google.com/maps/search/?api=1&query={q}"
+
+# ----------------------------
+# Deterministic travel postprocess (THE FIX)
+# ----------------------------
+def choose_mode_for_leg(
+    allowed_modes: List[str],
+    matrix: Dict[str, Any],
+    i: int,
+    j: int,
+) -> Optional[str]:
+    """
+    Mode choice rule:
+    - if walking allowed AND walking distance <= 2.0km -> walking
+    - else if public_transport allowed -> public_transport
+    - else if cycling allowed -> cycling
+    - else -> driving
+    Fallback: first mode with non-null duration.
+    """
+    def get_dist(mode: str) -> Optional[float]:
+        try:
+            return matrix[mode]["distance_km"][i][j]
+        except Exception:
+            return None
+
+    def get_dur(mode: str) -> Optional[float]:
+        try:
+            return matrix[mode]["duration_min"][i][j]
+        except Exception:
+            return None
+
+    # primary rule
+    if "walking" in allowed_modes:
+        d = get_dist("walking")
+        if d is not None and d <= 2.0:
+            return "walking"
+
+    if "public_transport" in allowed_modes:
+        if get_dur("public_transport") is not None:
+            return "public_transport"
+
+    if "cycling" in allowed_modes:
+        if get_dur("cycling") is not None:
+            return "cycling"
+
+    if "driving" in allowed_modes:
+        if get_dur("driving") is not None:
+            return "driving"
+
+    # fallback: any available mode
+    for m in ("walking", "public_transport", "cycling", "driving"):
+        if m in allowed_modes and get_dur(m) is not None:
+            return m
+
+    return None
+
+def compute_leg_metrics(
+    routes: Dict[str, Any],
+    allowed_modes: List[str],
+    from_loc: str,
+    to_loc: str,
+) -> Tuple[Optional[str], Optional[float], Optional[int]]:
+    """
+    Returns: (mode, distance_km, duration_minutes_int) using NxN matrix.
+    """
+    stops = routes.get("stops") or []
+    matrix = routes.get("matrix") or {}
+    if not stops or not matrix:
+        return (None, None, None)
+
+    idx = {stops[k]: k for k in range(len(stops))}
+    if from_loc not in idx or to_loc not in idx:
+        return (None, None, None)
+
+    i, j = idx[from_loc], idx[to_loc]
+    mode = choose_mode_for_leg(allowed_modes, matrix, i, j)
+    if not mode:
+        return (None, None, None)
+
+    try:
+        d = matrix[mode]["distance_km"][i][j]
+        t = matrix[mode]["duration_min"][i][j]
+    except Exception:
+        return (None, None, None)
+
+    if d is None or t is None:
+        return (mode, None, None)
+
+    # duration_min is float; model wants int minutes
+    return (mode, float(d), int(round(float(t))))
+
+def postprocess_itinerary(
+    itinerary: ItineraryModel,
+    routes: Dict[str, Any],
+    allowed_modes: List[str],
+    origin: str,
+    addr_to_meta: Dict[str, Dict[str, Any]],
+) -> ItineraryModel:
+    """
+    Overwrite travel fields deterministically from routes.matrix.
+    Also fill map_url from address/place_id.
+    """
+    total_km = 0.0
+
+    for day in itinerary.days:
+        prev_loc = origin
+        for idx, act in enumerate(day.activities):
+            # Fill map_url deterministically
+            meta = addr_to_meta.get(act.location)
+            act.map_url = maps_search_url(act.location, meta.get("place_id") if meta else None)
+
+            # Compute travel from prev_loc -> act.location
+            mode, dist_km, dur_min = compute_leg_metrics(routes, allowed_modes, prev_loc, act.location)
+
+            act.travel_mode = mode
+            act.distance_from_prev = dist_km
+            act.duration_minutes = dur_min
+
+            if dist_km is not None:
+                total_km += dist_km
+
+            prev_loc = act.location
+
+    itinerary.total_distance_km = round(total_km, 2)
+
+    # Optional: add a deterministic note if any locations weren't in stops
+    stops = set(routes.get("stops") or [])
+    missing = []
+    for day in itinerary.days:
+        for act in day.activities:
+            if act.location not in stops:
+                missing.append(act.location)
+    if missing:
+        msg = f"Some activity locations were not in the route stops list, so travel metrics could not be computed for them: {missing[:5]}"
+        itinerary.notes = (itinerary.notes + "\n" + msg) if itinerary.notes else msg
+
+    return itinerary
+
+# ----------------------------
+# Agents (LLM-only)
+# ----------------------------
+planner_agent = Agent(
+    role="Senior Travel Agent",
+    goal="Create a trip plan strictly from CONTEXT_JSON. Never invent places.",
+    backstory="You are a senior travel agent who plans realistic schedules using only provided options.",
+    llm="gpt-5-mini",
+    temperature=0.25,
+    verbose=False,
+    tools=[],  # IMPORTANT: no tools in planner (Python did all tools)
+)
+
+writer_agent = Agent(
+    role="Itinerary Writer Agent",
+    goal="Write Markdown from the provided itinerary JSON without inventing new places.",
+    backstory="You write clear, engaging itineraries that stick to the provided structured plan.",
+    llm="gpt-4o-mini",
+    temperature=0.3,
+    verbose=False,
+)
+
+# ----------------------------
+# Core logic
+# ----------------------------
 def generate_itinerary(location, start_date, end_date, preferences, transport_modes):
     t0 = time.time()
     print("✅ Button clicked:", location, start_date, end_date, transport_modes, preferences)
 
     try:
-        # ---- normalize dates ----
-        start_date = normalize_date(start_date)
-        end_date = normalize_date(end_date)
-        trip_duration_days, _ = expand_dates(start_date, end_date)
+        if not location or not str(location).strip():
+            return "### ❌ Error\nPlease enter a destination."
 
-        # ---- normalize modes ----
+        # Normalize dates
+        start_date_iso = to_iso_date(start_date)
+        end_date_iso = to_iso_date(end_date)
+        days_count, date_list = expand_dates(start_date_iso, end_date_iso)
+
         if isinstance(transport_modes, str):
             transport_modes = [transport_modes]
-        transport_modes = transport_modes or ["walking"]
+        transport_modes = [m for m in (transport_modes or []) if m]
+        if not transport_modes:
+            transport_modes = ["walking"]
 
-        # =========================
-        # (A) Python: GOOGLE MAPS (once)
-        # =========================
-        terms = preference_terms(preferences)
-        activities, cuisine_preferences = split_terms_for_maps(terms)
+        pref_terms = preference_terms(preferences or "")
+        activity_terms = extract_activity_terms(preferences or "")
 
-        maps_data = maps_tool.run(
+        # --------------------
+        # 1) Python: Maps (once)
+        # --------------------
+        # cuisine_preferences is optional and your maps tool expects a dict keyed by meals,
+        # but we do not "guess cuisines" from preferences; we keep it None for neutrality.
+        places_raw = maps_tool.run(
             location=location,
-            activities=activities if activities else None,
-            cuisine_preferences=cuisine_preferences,
+            activities=activity_terms if (preferences and activity_terms) else None,
+            cuisine_preferences=None,
             max_results_per_query=20,
         )
 
-        places_by_cat = compact_places(maps_data, per_cat=6, max_cats=14)
-        if not places_by_cat:
-            raise RuntimeError("Google Maps tool returned no usable places.")
+        # Make places compact + deterministic
+        places_compact = compact_places(places_raw, per_cat=6)
+        candidates = flatten_candidates(places_compact)
 
-        # =========================
-        # (B) Python: WEATHER (once) — EXACT SIGNATURE FOR YOUR WeatherTool
-        # =========================
-        weather_data = weather_tool.run(
+        # --------------------
+        # 2) Python: Weather (once)
+        # --------------------
+        weather_raw = weather_tool.run(
             city=location,
-            start_date=start_date,
-            end_date=end_date,
+            start_date=start_date_iso,
+            end_date=end_date_iso,
         )
-        weather_slim = slim_weather_for_context(weather_data)
 
-        # =========================
-        # (C) Python: ROUTE MATRIX (once)
-        # =========================
-        destinations = build_destinations_for_routes(places_by_cat, location, cap=12)
-        if not destinations:
-            raise RuntimeError("No destinations built for routing.")
+        # Convert weather list -> date map
+        weather_by_date: Dict[str, Dict[str, Any]] = {}
+        for row in weather_raw.get("forecasts", []) or []:
+            d = row.get("date")
+            if not d:
+                continue
+            weather_by_date[d] = {
+                "temp_max": row.get("temp_max"),
+                "temp_min": row.get("temp_min"),
+                "precipitation_mm": row.get("precipitation_mm"),
+            }
 
-        route_data = route_tool.run(
+        # --------------------
+        # 3) Python: Semantic pre-rank (once)
+        # --------------------
+        ranked = semantic_rank(preferences or "", candidates, top_k=30)
+
+        # split into meal lists + activity list (still preference-driven)
+        bundle = split_ranked_by_meals(ranked, k_meal=4, k_activity=10)
+
+        # Build allowed locations (<= 9 destinations for NxN matrix safety)
+        allowed_locations = build_allowed_locations(bundle, max_destinations=9)
+
+        # --------------------
+        # 4) Python: Route (once) — NxN over origin + allowed_locations
+        # --------------------
+        routes = route_tool.run(
             origin=location,
-            destinations=destinations,
+            destinations=allowed_locations,
             modes=transport_modes,
-            max_results=12,
+            max_results=10,
             return_matrix=True,
         )
 
-        # Slim route data for context
-        route_slim = {
-            "stops": route_data.get("stops"),
-            "modes_requested": route_data.get("modes_requested"),
-            "matrix": route_data.get("matrix"),
-        }
+        # Lookup metadata by address (for map_url / ratings etc.)
+        addr_to_meta = place_lookup(places_compact)
 
-        if not route_slim["stops"] or not route_slim["matrix"]:
-            raise RuntimeError("Route tool did not return usable stops/matrix.")
-
-        # =========================
-        # (D) Compact deterministic context for the planner
-        # =========================
-        context = {
+        # --------------------
+        # 5) LLM: Planner (no tools) — compact deterministic context
+        # --------------------
+        context_json = {
             "location": location,
-            "start_date": start_date,
-            "end_date": end_date,
-            "trip_duration_days": trip_duration_days,
-            "preferences": preferences,
+            "start_date": start_date_iso,
+            "end_date": end_date_iso,
+            "trip_duration_days": days_count,
+            "preferences": preferences or "",
             "transport_modes": transport_modes,
-            "places": places_by_cat,
-            "weather": weather_slim,
-            "routes": route_slim,
+            "places": {
+                "breakfast": bundle["breakfast"],
+                "lunch": bundle["lunch"],
+                "dinner": bundle["dinner"],
+                "activities": bundle["activities"],
+            },
+            "weather": weather_by_date,
+            "routes": {
+                # Planner only needs the deterministic allowed list.
+                # Travel fields will be computed in Python from matrix after.
+                "stops": routes.get("stops"),
+                "modes_requested": routes.get("modes_requested"),
+            },
+            "RULES": [
+                "Use ONLY the provided places lists. Never invent new places.",
+                "Each activity.location MUST be exactly one of the provided place addresses (verbatim).",
+                "You must produce exactly trip_duration_days day-plans, matching the date range.",
+                "Keep each day within 08:00–22:00.",
+                "Use weather to bias indoor vs outdoor choices (rain -> museums/indoor).",
+                "Do not worry about distance/time fields; Python will compute travel metrics.",
+                "Still output travel_mode/distance_from_prev/duration_minutes fields (can be null).",
+            ],
         }
-        context_json = safe_json_dumps(context)
 
-        # =========================
-        # (E) LLM: Planner + Writer
-        # =========================
         planning_task = Task(
             description=(
-                "Build an itinerary ONLY from the provided CONTEXT_JSON.\n"
-                "Never invent places.\n\n"
-                f"CONTEXT_JSON={context_json}\n\n"
-                "Rules:\n"
-                "- Output MUST match ItineraryModel exactly.\n"
-                "- Each activity.location MUST be exactly one of routes.stops (verbatim).\n"
-                "- Use routes.matrix for consecutive travel times.\n"
-                "- Mode choice:\n"
-                "  • if walking allowed and walking distance <= 2.0km -> walking\n"
-                "  • else if public_transport allowed -> public_transport\n"
-                "  • else if cycling allowed -> cycling\n"
-                "  • else -> driving\n"
-                "- Keep day within 08:00–22:00.\n"
-                "- Use weather to bias indoor/outdoor.\n"
-                "- Ensure variety across days.\n"
-                "- Include: name, category, start_time, end_time, location, rating (if any), reasoning, "
-                "weather_forecast (short), distance_from_prev, duration_minutes, travel_mode.\n"
-                f"- transport_modes must equal: {safe_json_dumps(transport_modes)}\n"
+                "Build an itinerary ONLY from the provided CONTEXT_JSON. Never invent places.\n\n"
+                f"CONTEXT_JSON={json.dumps(context_json, ensure_ascii=False)}\n\n"
+                "Output MUST match ItineraryModel exactly.\n"
             ),
-            expected_output="Structured JSON itinerary matching ItineraryModel.",
+            expected_output="A JSON itinerary matching ItineraryModel exactly.",
             agent=planner_agent,
             output_pydantic=ItineraryModel,
         )
 
-        writing_task = Task(
-            description=(
-                "Write Markdown from the itinerary JSON produced by the planner.\n"
-                "Do NOT invent places.\n"
-                f"At the top include: **Trip Dates:** {start_date} → {end_date}\n"
-                "For each activity include rating inline when present and a travel line when present.\n"
-                "Use headers per day and bold timestamps."
-            ),
-            expected_output="Markdown itinerary.",
-            agent=writer_agent,
-            context=[planning_task],
-        )
-
-        crew = Crew(
-            agents=[planner_agent, writer_agent],
-            tasks=[planning_task, writing_task],
+        planner_crew = Crew(
+            agents=[planner_agent],
+            tasks=[planning_task],
             verbose=True,
         )
 
-        result = crew.kickoff(inputs={})
+        _ = planner_crew.kickoff()
+
+        # Extract the Pydantic object (CrewAI stores in task.output)
+        planned = getattr(planning_task, "output", None)
+        planned_obj = getattr(planned, "pydantic", None) or getattr(planned, "output_pydantic", None)
+
+        if planned_obj is None:
+            # fallback: try parse raw json
+            raw = getattr(planned, "raw", None) or str(planned)
+            planned_obj = ItineraryModel.model_validate_json(raw)
+
+        itinerary: ItineraryModel = planned_obj
+
+        # --------------------
+        # 6) Python: overwrite travel fields deterministically (THE FIX)
+        # --------------------
+        itinerary = postprocess_itinerary(
+            itinerary=itinerary,
+            routes=routes,
+            allowed_modes=transport_modes,
+            origin=location,
+            addr_to_meta=addr_to_meta,
+        )
+
+        itinerary_json = itinerary.model_dump()
+
+        # --------------------
+        # 7) LLM: Writer — Markdown from corrected JSON
+        # --------------------
+        writing_task = Task(
+            description=(
+                "Write Markdown from ITINERARY_JSON. Do NOT invent places.\n\n"
+                f"**Trip Dates:** {start_date_iso} → {end_date_iso}\n\n"
+                f"ITINERARY_JSON={json.dumps(itinerary_json, ensure_ascii=False)}\n\n"
+                "Formatting rules:\n"
+                "- Use a header per day.\n"
+                "- Bold timestamps.\n"
+                "- Include rating inline when present (⭐ 4.7).\n"
+                "- Include travel line when present: '*Travel to next: 12-minute walk, 1.1 km*'.\n"
+                "- Only describe places in the JSON.\n"
+            ),
+            expected_output="Markdown itinerary.",
+            agent=writer_agent,
+        )
+
+        writer_crew = Crew(
+            agents=[writer_agent],
+            tasks=[writing_task],
+            verbose=True,
+        )
+
+        result = writer_crew.kickoff()
         markdown_itinerary = (
             result if isinstance(result, str)
             else getattr(result, "raw", None) or str(result)
@@ -390,27 +634,27 @@ def generate_itinerary(location, start_date, end_date, preferences, transport_mo
         print(tb)
         return f"### ❌ Error\n```text\n{tb}\n```"
 
-# =========================
-# GRADIO UI
-# =========================
+# ----------------------------
+# UI
+# ----------------------------
 with gr.Blocks(theme=gr.themes.Soft()) as demo:
     gr.Markdown("## 🧭 AI-Powered Travel Itinerary Planner")
-    gr.Markdown("Plan optimized, weather-aware trips powered by multi-agent reasoning 🌍")
+    gr.Markdown("Fix 2: Python tools first → compact deterministic planner context → deterministic travel postprocess ✅")
 
     with gr.Row():
-        location = gr.Textbox(label="Destination", placeholder="e.g. Venice, Italy")
+        location = gr.Textbox(label="Destination", placeholder="e.g. Bologna, Italy")
         transport_modes = gr.CheckboxGroup(
             ["walking", "public_transport", "driving", "cycling"],
-            label="transport_modes",
+            label="Transport modes",
             value=["walking"],
-            info="Select one or multiple modes for route optimization"
+            info="Select one or multiple modes for route optimization",
         )
 
     with gr.Row():
         start_date = gr.DateTime(label="Start Date", include_time=False, type="datetime")
         end_date = gr.DateTime(label="End Date", include_time=False, type="datetime")
 
-    preferences = gr.Textbox(label="Your Preferences", placeholder="art, local food, relaxed pace, avoid queues")
+    preferences = gr.Textbox(label="Your Preferences", placeholder="art, local food, craft beer, relaxed pace, avoid queues")
 
     generate_btn = gr.Button("📝 Generate Itinerary")
     itinerary_markdown = gr.Markdown(label="🔖 Your Personalized Itinerary")
@@ -418,7 +662,7 @@ with gr.Blocks(theme=gr.themes.Soft()) as demo:
     generate_btn.click(
         fn=generate_itinerary,
         inputs=[location, start_date, end_date, preferences, transport_modes],
-        outputs=[itinerary_markdown]
+        outputs=[itinerary_markdown],
     )
 
 demo.queue(default_concurrency_limit=1, max_size=20)
