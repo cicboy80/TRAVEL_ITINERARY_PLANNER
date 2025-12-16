@@ -689,8 +689,11 @@ def generate_itinerary(location, start_date, end_date, preferences, transport_mo
                 "- Use a header per day.\n"
                 "- Bold timestamps.\n"
                 "- Include rating inline when present (⭐ 4.7).\n"
-                "- For each day: include a travel line for every activity *except the first activity of that day*.\n"
-                "- Travel line format (exactly): *Travel from previous: {duration_minutes} min, {distance_from_prev} km ({travel_mode})*\n"
+                "- For each day: for each activity in order:\n"
+                "  - If it is NOT the first activity of the day (index > 0), print this line immediately BEFORE the activity block:\n"
+                "    *Travel from previous: {duration_minutes} min, {distance_from_prev} km ({travel_mode})*\n"
+                "  - If it IS the first activity of the day (index == 0), do NOT print any travel line, even if travel fields are present.\n"
+                "- Do NOT create separate '### Travel' sections. The travel line must be the single italic line shown above.\n"
                 "- Only describe places in the JSON.\n"
             ),
             expected_output="Markdown itinerary.",
