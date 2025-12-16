@@ -92,8 +92,7 @@ planner_agent = Agent(
     tools=[semantic_ranking_tool],
     llm="gpt-5-mini",
     temperature=0.3,
-    output_schema=ItineraryModel,
-    reasoning=True,
+    reasoning=False,
     verbose=False
 )
 
@@ -109,8 +108,8 @@ writer_agent = Agent(
         "adept at crafting engaging, realistic itineraries that reflect real cities, landmarks, and restaurants. "
         "You avoid speculation or fictional places unless explicitly provided."
     ),
-    llm="gpt-4o",
-    temperature=0.7,
+    llm="gpt-4o-mini",
+    temperature=0.3,
     verbose=False
 )
 
@@ -243,7 +242,8 @@ def generate_itinerary(location, start_date, end_date, preferences, transport_mo
             expected_output="A structured JSON itinerary with complete metadata and travel-aware timestamps for each activity.",
             context=[retrieval_task, weather_task, route_task],
             agent=planner_agent,
-            reasoning=True
+            output_pydantic=ItineraryModel,
+            reasoning=False
         )
 
         writing_task = Task(

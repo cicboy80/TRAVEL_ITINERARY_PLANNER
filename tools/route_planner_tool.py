@@ -4,7 +4,6 @@ from typing import List, Dict, Union, Optional, Any
 from crewai.tools import BaseTool
 from pydantic import BaseModel, Field, field_validator, ConfigDict
 import time
-import random
 import json
 from utils.cache import SQLiteCache
 
@@ -92,7 +91,7 @@ class RoutePlannerToolSchema(BaseModel):
                 )
             else:
                 s = item
-                
+
             s = str(s).strip()
             if not s or s.isdigit():
                 continue
@@ -131,17 +130,67 @@ class RoutePlannerToolSchema(BaseModel):
 class RoutePlannerTool(BaseTool):
     """
     CrewAI-compatible tool for computing optimal routes between locations
-    using Google Directions API with multi-mode transport support.
+    using Google Distance Matrix with multi-mode transport support.
     """
 
     name: str = "Route Planner Tool"
     description: str = (
         "Computes walking, public transport, cycling, or driving routes between locations. "
-        "Automatically selects walking for short distances (<2km) and public transport for longer trips "
-        "if both modes are provided."
+        "Uses Google Distance Matrix for speed. Automatically selects walking for short distances (<2km) "
+        "and public transport for longer trips if both modes are provided."
     )
 
     args_schema = RoutePlannerToolSchema
+
+    def _distance_matrix(
+            self,
+            client: httpx.Client,
+            origin: str,
+            destinations: List[str],
+            mode: str,
+            api_key: str
+    ) -> Dict[str, Any]:
+        """Call Google Distance Matrix for origin -> multiple destinations in one request."""
+        url = "https://maps.googleapis.com/maps/api/distancematrix/json"
+        params = {
+            "origins": origin,
+            "destinations": "|".join(destinations),
+            "mode": mode,
+            "key": api_key,
+        }
+        if mode == "transit":
+            params["departure_time"] = int(time.time())
+
+        # cache key (transit depends on time bucket)
+        origin_k = origin.strip().lower()
+        dests_k = "|".join([d.strip().lower() for d in destinations])
+        mode_k = mode.strip().lower()
+
+        dep_bucket = ""
+        if mode_k == "transit":
+            dep_bucket = f"t{int(time.time() // 900)}" #15 min bucket
+
+        cache_key = f"distmat::{origin_k}::{mode_k}::{dests_k}"
+        if dep_bucket:
+            cache_key = f"{cache_key}::{dep_bucket}"
+
+        cached = cache.get(cache_key)
+        if cached is not None:
+            return cached
+        
+        r = client.get(url, params=params, timeout=20.0)
+        r.raise_for_status()
+        data = r.json()
+
+        if data.get("status") != "OK":
+            status = data.get("status")
+            err = data.get("error_message", "")
+            raise RuntimeError(f"DistanceMatrix status={status}: {err}")
+
+        # TTL: transit is short-lived; others are longer
+        ttl = 30 * 60 if mode_k == "transit" else 24 * 3600
+        cache.set(cache_key, data, ttl_seconds=ttl)
+        return data  
 
     def _run(
         self,
@@ -173,156 +222,90 @@ class RoutePlannerTool(BaseTool):
             except Exception:
                 pass
 
-        if isinstance(modes, list):
-            modes = [str(x).strip() for x in modes if x is not None]
-            modes = [m for m in modes if m]
-            modes = ["transit" if m == "public_transport" else m for m in modes]
-
         if isinstance(modes,str):
-            modes = [modes]
+            modes_list = [modes.strip()]
+        else:
+            modes_list = [str(m).strip() for m in modes if m is not None]
 
-        if not destinations:
+        norm_modes: List[str] = []
+        for m in modes_list:
+            if m == "public_transport":
+                norm_modes.append("transit")
+            elif m == "cycling":
+                norm_modes.append("bicycling")
+            else:
+                norm_modes.append(m)
+
+        # sanitize
+        norm_modes = [m for m in norm_modes if m]
+
+        # Destination list
+        MAX_DM_DESTS = 25
+        dests = [str(d).strip() for d in destinations if str(d).strip()][:min(max_results, MAX_DM_DESTS)]
+        if not dests:
             return []
 
-        base_url = "https://maps.googleapis.com/maps/api/directions/json"
-        results = []
-
         with httpx.Client(timeout=20.0) as client:
-            for dest in destinations[:max_results]:
-                dest = str(dest).strip()
-                if not dest:
-                    continue
-                best_route = None
+            dm_by_mode: Dict[str, Dict[str, Any]] = {}
+
+            # call each requested mode once
+            for m in ("walking", "transit", "driving", "bicycling"):
+                if m in norm_modes:
+                    dm_by_mode[m] = self._distance_matrix(client, origin, dests, m, api_key)
+
+            results: List[Dict[str, Union[str, float]]] = []
+
+            # Distance matrix rows[0].elements alighns with destination array
+            for i, dest in enumerate(dests):
+                best: Optional[Dict[str, Union[str, float]]] = None
+
+                # Helper to extract one element
+                def get_el(mode: str) -> Optional[Dict[str, Any]]:
+                    dm = dm_by_mode.get(mode)
+                    if not dm:
+                        return None
+                    try:
+                        el = dm["rows"][0]["elements"][i]
+                    except Exception:
+                        return None
+                    return el if el.get("status") == "OK" else None
 
                 # Try walking first
-                if "walking" in modes:
-                    walk_params = {"origin": origin, "destination": dest, "mode": "walking", "key": api_key}
-                    walk_data = self._fetch_route(client, base_url, walk_params)
-                    if walk_data:
-                        best_route = {**walk_data, "mode": "walking"}
-
-                # Try public transport if walking route > 2km or not available
-                if ("public_transport" in modes or "transit" in modes) and (
-                    not best_route or best_route["distance_km"] > 2
-                ):
-                    transit_params = {
-                        "origin": origin,
-                        "destination": dest,
-                        "mode": "transit",
-                        "transit_mode": "bus|subway|train|tram",
-                        "key": api_key
+                el_walk = get_el("walking")
+                if el_walk:
+                    walk_km = round(el_walk["distance"]["value"] / 1000, 2)
+                    walk_min = round(el_walk["duration"]["value"] / 60, 1)
+                    best = {
+                        "mode": "walking",
+                        "distance_km": walk_km,
+                        "duration_min": walk_min,
                     }
 
-                    transit_params["departure_time"] = "now"
+                # Try public transport if walking route > 2km or not available
+                el_transit = get_el("transit")
+                if el_transit and (best is None or float(best["distance_km"]) > 2.0):
+                    tr_km = round(el_transit["distance"]["value"] / 1000, 2)
+                    tr_min = round(el_transit["duration"]["value"] / 60, 1)
+                    cand = {
+                        "mode": "public_transport",
+                        "distance_km": tr_km,
+                        "duration_min": tr_min,
+                    }
+                    if best is None or float(cand["duration_min"]) < float(best["duration_min"]):
+                        best = cand
 
-                    transit_data = self._fetch_route(client, base_url, transit_params)
-                    if transit_data:
-                        if not best_route or transit_data["duration_min"] < best_route["duration_min"]:
-                            best_route = {**transit_data, "mode": "public_transport"}
-            
-                # Cycling if included
-                if "cycling" in modes and not best_route:
-                    bike_params = {"origin": origin, "destination": dest, "mode": "bicycling", "key": api_key}
-                    bike_data = self._fetch_route(client, base_url, bike_params)
-                    if bike_data:
-                        best_route = {**bike_data, "mode": "cycling"}
+                # bicycling / driving if requested and nothing else worked
+                if best is None:
+                    for fallback_mode, label in (("bicycling", "cycling"), ("driving", "driving")):
+                        el = get_el(fallback_mode)
+                        if el:
+                            km = round(el["distance"]["value"] / 1000, 2)
+                            mn = round(el["duration"]["value"] / 60, 1)
+                            best = {"mode": label, "distance_km": km, "duration_min": mn}
+                            break
 
-                # Try driving if included and others unavailable
-                if "driving" in modes and not best_route:
-                    drive_params = {"origin": origin, "destination": dest, "mode": "driving", "key": api_key}
-                    drive_data = self._fetch_route(client, base_url, drive_params)
-                    if drive_data:
-                        best_route = {**drive_data, "mode": "driving"}
-
-                if best_route:
-                    best_route["destination"] = dest
-                    results.append(best_route)
-
+                if best:
+                    best["destination"] = dest
+                    results.append(best)              
+                
             return results
-
-    def _fetch_route(self, client: httpx.Client, base_url: str, params: Dict) -> Optional[Dict]:
-        """Fetch and parse route data from Google Directions API."""
-        origin = str(params.get("origin", "")).strip().lower()
-        dest = str(params.get("destination", "")).strip().lower()
-        mode = str(params.get("mode", "")).strip().lower()
-        transit_mode = str(params.get("transit_mode", "")).strip().lower()
-
-        # Transit results depend on departure_time, so include a time bucket in the cache key
-        departure_time = params.get("departure_time")
-        dep_bucket = ""
-        if mode == "transit":
-            if departure_time == "now":
-                dep_bucket = f"t{int(time.time() // 900)}" #15-min bucket
-            elif departure_time is not None:
-                dep_bucket = f"t{departure_time}"
-
-        key = f"route::{origin}::{dest}::{mode}::{transit_mode}"
-        if dep_bucket:
-            key = f"{key}::{dep_bucket}"
-        
-        cached = cache.get(key)
-        if cached is not None:
-            if isinstance(cached, dict) and cached.get("__no_route__"):
-                return None
-            return cached
-        
-        # Cache TTL: transit should be short-lived, other are longer
-        success_ttl = 30 * 60 if mode == "transit" else 24 * 3600
-        negative_ttl = 10 * 60 # avoid hammering bad pairs
-        
-        for attempt in range(3):
-            try:
-                response = client.get(base_url, params=params)
-                response.raise_for_status()
-                data = response.json()
-
-                status = data.get("status", "")
-
-                # transient: retry, don't negative-cache
-                if status in ("OVER_QUERY_LIMIT", "UNKNOWN_ERROR"):
-                    raise RuntimeError(f"Transient Directions status: {status}")
-                
-                # hard auth/config issue: fail loudly
-                if status == "REQUEST_DENIED":
-                    raise RuntimeError(f"Directions REQUEST_DENIED: {data.get('error_message', '')}".strip())
-                
-
-                if data.get("status") != "OK" or not data.get("routes"):
-                    #cache negative results briefly to avoid hammering
-                    cache.set(key, {"__no_route__": True}, ttl_seconds=negative_ttl)
-                    return None
-
-                leg = data["routes"][0]["legs"][0]
-                out = {
-                    "distance_km": round(leg["distance"]["value"] / 1000, 2),
-                    "duration_min": round(leg["duration"]["value"] / 60, 1),
-                    "start_address": leg["start_address"],
-                    "end_address": leg["end_address"]
-                }
-
-                cache.set(key, out, ttl_seconds=success_ttl)
-                return out
-            
-            except (httpx.TimeoutException, httpx.RequestError) as e:
-                print(f"Directions network/timeout (attempt {attempt+1}/3): {e}")
-
-            except httpx.HTTPStatusError as e:
-                # retry only for transient HTTP codes
-                code = e.response.status_code
-                if code in (429, 500, 502, 503, 504):
-                    print(f"Directions HTTP {code} (attempt {attempt+1}/3): retrying")
-                else:
-                    print(f"Directions HTTP {code}: {e}")
-                    return None
-            
-            except RuntimeError:
-                # REQUEST_DENIED / hard failures should surface immediately
-                raise
-
-            except Exception as e:
-                print(f"Error fetching route (attempt {attempt+1}/3): {e}")
-                
-            # expinential-ish backoff + jitter
-            time.sleep((0.6 * (attempt +1)) + random.random() * 0.3)
-
-        return None
