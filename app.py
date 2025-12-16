@@ -1,4 +1,4 @@
-# app.py — Clean Fix 2 (Python tools first, deterministic planner context, Python travel postprocess)
+# app.py 
 
 import os
 import re
@@ -639,10 +639,10 @@ def generate_itinerary(location, start_date, end_date, preferences, transport_mo
 # ----------------------------
 with gr.Blocks(theme=gr.themes.Soft()) as demo:
     gr.Markdown("## 🧭 AI-Powered Travel Itinerary Planner")
-    gr.Markdown("Fix 2: Python tools first → compact deterministic planner context → deterministic travel postprocess ✅")
+    gr.Markdown("Plan optimized, weather-aware trips based on your preferences")
 
     with gr.Row():
-        location = gr.Textbox(label="Destination", placeholder="e.g. Bologna, Italy")
+        location = gr.Textbox(label="Destination", placeholder="e.g. Venice, Italy")
         transport_modes = gr.CheckboxGroup(
             ["walking", "public_transport", "driving", "cycling"],
             label="Transport modes",
@@ -654,7 +654,7 @@ with gr.Blocks(theme=gr.themes.Soft()) as demo:
         start_date = gr.DateTime(label="Start Date", include_time=False, type="datetime")
         end_date = gr.DateTime(label="End Date", include_time=False, type="datetime")
 
-    preferences = gr.Textbox(label="Your Preferences", placeholder="art, local food, craft beer, relaxed pace, avoid queues")
+    preferences = gr.Textbox(label="Your Preferences", placeholder="art, local food, museums, relaxed pace, avoid queues")
 
     generate_btn = gr.Button("📝 Generate Itinerary")
     itinerary_markdown = gr.Markdown(label="🔖 Your Personalized Itinerary")
