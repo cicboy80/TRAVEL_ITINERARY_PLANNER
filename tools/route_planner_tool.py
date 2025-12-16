@@ -20,7 +20,7 @@ class RoutePlannerToolSchema(BaseModel):
     # Optional NxN matrix output
     return_matrix: bool = Field(
         default=False,
-        description="If true, also return an NxN distance/duration matrix over [origin] + destinations."
+        description="If true, also return an NxN distance/duration matrix over [origin] + destinations.",
     )
 
     @field_validator("origin", mode="before")
@@ -81,7 +81,6 @@ class RoutePlannerToolSchema(BaseModel):
                     flat.append(x)
             v = flat
 
-        # If already a list sanitize items
         if not isinstance(v, list):
             return v
 
@@ -118,7 +117,6 @@ class RoutePlannerToolSchema(BaseModel):
 
         if isinstance(v, str):
             s = v.strip()
-            # handle stringified list like '["walking","public_transport"]' or "['walking','public_transport']"
             if s.startswith("[") and s.endswith("]"):
                 try:
                     s_json = s.replace("'", '"')
@@ -151,13 +149,15 @@ class RoutePlannerTool(BaseTool):
 
     args_schema = RoutePlannerToolSchema
 
+    # -------------------- INTERNAL HELPERS --------------------
+
     def _distance_matrix(
         self,
         client: httpx.Client,
         origins: List[str],
         destinations: List[str],
         mode: str,
-        api_key: str
+        api_key: str,
     ) -> Dict[str, Any]:
         """Call Google Distance Matrix for origins -> destinations in one request."""
         url = "https://maps.googleapis.com/maps/api/distancematrix/json"
@@ -191,13 +191,11 @@ class RoutePlannerTool(BaseTool):
         r.raise_for_status()
         data = r.json()
 
-        # clean status/error handling 
         status = data.get("status")
         if status != "OK":
             err = data.get("error_message", "")
             raise RuntimeError(f"DistanceMatrix status={status}: {err}")
 
-        # TTL: transit is short-lived; others are longer
         ttl = 30 * 60 if mode_k == "transit" else 24 * 3600
         cache.set(cache_key, data, ttl_seconds=ttl)
         return data
@@ -226,21 +224,17 @@ class RoutePlannerTool(BaseTool):
 
         return {"distance_km": dist_km, "duration_min": dur_min}
 
+    # -------------------- MAIN ENTRY --------------------
+
     def _run(
         self,
         origin: str,
         destinations: List[str],
         modes: Union[str, List[str]] = "walking",
         max_results: int = 10,
-        return_matrix: bool = False,  # ✅ NEW
+        return_matrix: bool = False,
     ) -> Union[List[Dict[str, Union[str, float]]], Dict[str, Any]]:
-        """
-        Calculates travel routes between a starting location and multiple destinations.
 
-        Returns:
-          - default: List[Dict] (same as before)
-          - if return_matrix=True: Dict with stops + origin_routes + matrix
-        """
         api_key = os.getenv("GOOGLE_MAPS_API_KEY")
         if not api_key:
             raise ValueError("Missing GOOGLE_MAPS_API_KEY in environment variables")
@@ -257,7 +251,8 @@ class RoutePlannerTool(BaseTool):
         else:
             modes_list = [str(m).strip() for m in modes if m is not None]
 
-        # normalize mode labels
+        # normalize input labels -> Google API labels
+        # user: public_transport/cycling -> api: transit/bicycling
         norm_modes: List[str] = []
         for m in modes_list:
             if m == "public_transport":
@@ -269,15 +264,34 @@ class RoutePlannerTool(BaseTool):
 
         norm_modes = [m for m in norm_modes if m]  # sanitize
 
+        # output labels expected by planner
+        api_to_user = {
+            "walking": "walking",
+            "transit": "public_transport",
+            "driving": "driving",
+            "bicycling": "cycling",
+        }
+
         # Destination list
         MAX_DM_DESTS = 25
-        dests = [str(d).strip() for d in destinations if str(d).strip()][:min(max_results, MAX_DM_DESTS)]
-        if not dests:
-            return [] if not return_matrix else {"stops": [origin], "origin_routes": [], "matrix": {}}
+        dests = [str(d).strip() for d in destinations if str(d).strip()][
+            : min(max_results, MAX_DM_DESTS)
+        ]
 
-        # NxN matrix safety: Distance Matrix elements = origins*destinations (cap ~100)
-        # => stops_total <= 10 keeps NxN <= 100
-        MAX_STOPS_FOR_NXN = 10
+        if not dests:
+            if not return_matrix:
+                return []
+            return {
+                "origin": origin,
+                "destinations": [],
+                "stops": [origin],
+                "modes_requested": [api_to_user[m] for m in norm_modes if m in api_to_user],
+                "origin_routes": [],
+                "matrix": {},
+            }
+
+        # NxN safety: origins*destinations should stay <= ~100 elements
+        MAX_STOPS_FOR_NXN = 10  # origin + first 9 destinations
 
         with httpx.Client(timeout=20.0) as client:
             # 1) origin -> dests (1xN) per requested mode
@@ -338,23 +352,25 @@ class RoutePlannerTool(BaseTool):
                     best["destination"] = dest
                     results.append(best)
 
-            # 2) Optional: NxN matrix over [origin] + destinations (still within this single tool run)
+            # 2) Optional: NxN matrix over [origin] + destinations (still within single tool run)
             if not return_matrix:
                 return results
 
             stops = [origin] + dests
             if len(stops) > MAX_STOPS_FOR_NXN:
-                stops = stops[:MAX_STOPS_FOR_NXN]  # origin + first 9 destinations
+                stops = stops[:MAX_STOPS_FOR_NXN]
 
             nxn_by_mode: Dict[str, Any] = {}
             for m in ("walking", "transit", "driving", "bicycling"):
                 if m in norm_modes:
                     dm_nxn = self._distance_matrix(client, stops, stops, m, api_key)
-                    nxn_by_mode[m] = self._parse_nxn(dm_nxn)
+                    nxn_by_mode[api_to_user[m]] = self._parse_nxn(dm_nxn)
 
             return {
-                "stops": stops,
-                "modes_requested": norm_modes,
-                "origin_routes": results,
-                "matrix": nxn_by_mode,
+                "origin": origin,
+                "destinations": dests,
+                "stops": stops,  # indexable list used by planner
+                "modes_requested": [api_to_user[m] for m in norm_modes if m in api_to_user],
+                "origin_routes": results,  # origin -> each stop (best mode per stop)
+                "matrix": nxn_by_mode,      # NxN per mode (planner keys!)
             }
