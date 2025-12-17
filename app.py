@@ -130,6 +130,9 @@ def compact_places(places_by_cat: Dict[str, List[Dict[str, Any]]], per_cat: int 
                     "rating": x.get("rating"),
                     "user_ratings_total": x.get("user_ratings_total"),
                     "place_id": x.get("place_id"),
+                    "types": x.get("types") or [],
+                    "price_level": x.get("price_level"),
+                    "business_status": x.get("business_status"),
                 }
             )
         out[cat] = cleaned
@@ -147,14 +150,26 @@ def flatten_candidates(compact: Dict[str, List[Dict[str, Any]]]) -> List[Dict[st
             addr = it.get("address")
             if not nm or not addr:
                 continue
+            types = ", ".join(it.get("types") or [])
+            price = it.get("price_level")
+            rating = it.get("rating")
+            reviews = it.get("user_ratings_total")
+            desc = (
+                f"{cat}. rating={rating} reviews={reviews} "
+                f"price_level={price} types={types}. Address={addr}"
+            )
+
             cands.append(
                 {
                     "name": nm,
                     "category": cat,
-                    "description": f"{cat} option at {addr}",
+                    "description": desc,
                     "address": addr,
-                    "rating": it.get("rating"),
+                    "rating": rating,
                     "place_id": it.get("place_id"),
+                    "user_ratings_total": reviews,
+                    "price_level": price,
+                    "types": it.get("types") or [],
                 }
             )
     # de-dupe by address (preserve order)
@@ -171,29 +186,15 @@ def flatten_candidates(compact: Dict[str, List[Dict[str, Any]]]) -> List[Dict[st
 def semantic_rank(preferences: str, candidates: List[Dict[str, Any]], top_k: int = 30) -> List[Dict[str, Any]]:
     if not preferences or not candidates:
         return candidates[:top_k]
+    
     ranked = semantic_tool.run(
         user_preferences=preferences,
-        candidates=[{"name": c["name"], "category": c["category"], "description": c["description"]} for c in candidates],
+        candidates=candidates,
         top_k=top_k,
         distance_weight=0.0,
     )
-    # ranked returns list[dict] with name/category/description/semantic_score
-    # reattach address/place_id/rating deterministically by name+category match, fallback to name match
-    by_key = {(c["name"], c["category"]): c for c in candidates}
-    by_name = {}
-    for c in candidates:
-        by_name.setdefault(c["name"], c)
 
-    out = []
-    for r in ranked:
-        k = (r.get("name"), r.get("category"))
-        c = by_key.get(k) or by_name.get(r.get("name"))
-        if not c:
-            continue
-        merged = dict(c)
-        merged["semantic_score"] = r.get("semantic_score")
-        out.append(merged)
-    return out[:top_k]
+    return ranked[:top_k] if isinstance(ranked, list) else []
 
 def split_ranked_by_meals(
     ranked: List[Dict[str, Any]],
@@ -277,6 +278,123 @@ def maps_search_url(address: str, place_id: Optional[str] = None) -> str:
 # Helper functions
 # ----------------------------
 
+def build_meal_hints(preferences: str) -> Dict[str, Optional[str]]:
+    """
+    Turns user preferences into short text hints for Google Places queries:
+      query = f"{hint} {meal} in {location}"
+    Returns: {"breakfast": "...", "lunch": "...", "dinner": "..."} with None if no hint.
+    """
+    if not preferences or not str(preferences).strip():
+        return {"breakfast": None, "lunch": None, "dinner": None}
+
+    # basic tokenization for comma-separated / free text
+    raw = re.split(r"[,\n;/|]+", preferences.lower())
+    tokens = {t.strip().replace("_", "-") for t in raw if t.strip()}
+
+    # canonical sets
+    DIETARY = {
+        "vegan": "vegan",
+        "vegetarian": "vegetarian",
+        "gluten-free": "gluten free",
+        "gluten free": "gluten free",
+    }
+
+    CUISINES = {
+        "italian": "italian",
+        "thai": "thai",
+        "japanese": "japanese",
+        "chinese": "chinese",
+        "french": "french",
+        "seafood": "seafood",
+        "local": "local",
+    }
+
+    QUALITY = {
+        "michelin-star": "michelin star",
+        "michelin star": "michelin star",
+        "michelin": "michelin star",
+    }
+
+    # extract (order matters; keep short)
+    dietary = []
+    for key in ("vegan", "vegetarian", "gluten-free", "gluten free"):
+        if key in tokens:
+            dietary.append(DIETARY[key])
+
+    cuisines = []
+    for key in ("local", "italian", "thai", "japanese", "chinese", "french", "seafood"):
+        if key in tokens:
+            cuisines.append(CUISINES[key])
+
+    michelin = None
+    for key in ("michelin-star", "michelin star", "michelin"):
+        if key in tokens:
+            michelin = QUALITY[key]
+            break
+
+    # simple conflict guard: if vegan/vegetarian, drop seafood keyword
+    if any(x in dietary for x in ("vegan", "vegetarian")):
+        cuisines = [c for c in cuisines if c != "seafood"]
+
+    # cap to keep queries tight
+    dietary = dietary[:2]            # e.g. "vegan gluten free"
+    cuisines = cuisines[:2]          # e.g. "local italian"
+
+    def hint_for(meal: str) -> Optional[str]:
+        parts = []
+        parts += dietary
+        parts += cuisines
+
+        # Michelin is most relevant for lunch/dinner
+        if michelin and meal in ("lunch", "dinner"):
+            parts.append(michelin)
+
+        # keep it compact
+        hint = " ".join(parts).strip()
+        return hint if hint else None
+
+    return {
+        "breakfast": hint_for("breakfast"),
+        "lunch": hint_for("lunch"),
+        "dinner": hint_for("dinner"),
+    }
+
+def extract_vibes(preferences: str, max_terms: int = 3) -> List[str]:
+    if not preferences or not str(preferences).strip():
+        return []
+
+    raw = re.split(r"[,\n;/|]+", preferences.lower())
+    tokens = {t.strip() for t in raw if t.strip()}
+
+    VIBES = {
+        "romantic": "romantic",
+        "relaxed": "relaxed",
+        "avoid crowds": "quiet",
+        "avoid crowd": "quiet",
+        "no crowds": "quiet",
+        "quiet": "quiet",
+        "fine dining": "fine dining",
+        "finedining": "fine dining",
+        "casual dining": "casual",
+        "casual": "casual",
+    }
+
+    # simple phrase matching (handles "avoid crowds" and "fine dining" in free text)
+    text = preferences.lower()
+
+    def has(term: str) -> bool:
+        return (term in text) if (" " in term) else (term in tokens)
+
+    out: List[str] = []
+    for key, normalized in VIBES.items():
+        if (" " in key and key in text) or (key in tokens):
+            if normalized not in out:
+                out.append(normalized)
+        if len(out) >= max_terms:
+            break
+
+    return out
+
 def choose_mode_for_leg(
     allowed_modes: List[str],
     matrix: Dict[str, Any],
@@ -322,7 +440,6 @@ def choose_mode_for_leg(
             return m
 
     return None
-
 
 def compute_leg_metrics_from_matrix(
     routes: Dict[str, Any],
@@ -426,7 +543,6 @@ def extract_unique_locations_in_order(itinerary: ItineraryModel) -> List[str]:
                 out.append(loc)
     return out
 
-
 def postprocess_itinerary(
     itinerary: ItineraryModel,
     route_tool: RoutePlannerTool,
@@ -437,16 +553,11 @@ def postprocess_itinerary(
     nxn_destination_cap: int = 9,  # origin + 9 = 10 stops
 ) -> ItineraryModel:
     """
-    Option A:
-    - Planner selects activities first
-    - Then we compute travel metrics
-      - If <= cap unique locations: single NxN matrix call
-      - Else: pairwise per-leg calls (still cached)
-
-    Always fills:
-    - act.map_url
-    - act.travel_mode, act.distance_from_prev, act.duration_minutes
-    - itinerary.total_distance_km
+    - Fills act.map_url deterministically
+    - Computes travel_mode / distance_from_prev / duration_minutes
+      - Uses per-day NxN matrix when day unique locations <= cap
+      - Falls back to pairwise per-leg when day exceeds cap or matrix missing values
+    - Sets itinerary.total_distance_km
     """
     total_km = 0.0
 
@@ -456,23 +567,30 @@ def postprocess_itinerary(
             meta = addr_to_meta.get(act.location)
             act.map_url = maps_search_url(act.location, meta.get("place_id") if meta else None)
 
-    # Decide routing strategy
-    unique_locs = extract_unique_locations_in_order(itinerary)
-    use_matrix = prefer_single_matrix and (len(unique_locs) <= nxn_destination_cap)
-
-    routes: Dict[str, Any] = {}
-    if use_matrix:
-        destinations = unique_locs[:nxn_destination_cap]
-        routes = route_tool.run(
-            origin=origin,
-            destinations=destinations,
-            modes=allowed_modes,
-            max_results=len(destinations),
-            return_matrix=True,
-        )
-
-    # Now compute legs day-by-day in itinerary order
+    # Per day routing matrix
     for day in itinerary.days:
+        # collect unique locations for this day (in order)
+        day_locs: List[str] = []
+        seen: set[str] = set()
+
+        for act in day.activities:
+            loc = (act.location or "").strip()
+            if loc and loc not in seen:
+                seen.add(loc)
+                day_locs.append(loc)
+
+        use_matrix = prefer_single_matrix and (len(day_locs) <= nxn_destination_cap)
+
+        routes: Dict[str, Any] = {}
+        if use_matrix:
+            routes = route_tool.run(
+                origin=origin,
+                destinations=day_locs,
+                modes=allowed_modes,
+                max_results=len(day_locs),
+                return_matrix=True,
+            )
+
         prev_loc = origin
         for act in day.activities:
             if use_matrix:
@@ -497,15 +615,6 @@ def postprocess_itinerary(
             prev_loc = act.location
 
     itinerary.total_distance_km = round(total_km, 2)
-
-    # Note if we had to use pairwise due to size
-    if not use_matrix and len(unique_locs) > nxn_destination_cap:
-        msg = (
-            f"Routing note: itinerary contains {len(unique_locs)} unique locations; "
-            f"computed travel metrics using per-leg routing (matrix cap is {nxn_destination_cap} destinations)."
-        )
-        itinerary.notes = (itinerary.notes + "\n" + msg) if itinerary.notes else msg
-
     return itinerary
 
 
@@ -553,7 +662,6 @@ def generate_itinerary(location, start_date, end_date, preferences, transport_mo
         if not transport_modes:
             transport_modes = ["walking"]
 
-        pref_terms = preference_terms(preferences or "")
         activity_terms = extract_activity_terms(preferences or "")
 
         # --------------------
@@ -561,17 +669,64 @@ def generate_itinerary(location, start_date, end_date, preferences, transport_mo
         # --------------------
         # cuisine_preferences is optional and your maps tool expects a dict keyed by meals,
         # but we do not "guess cuisines" from preferences; we keep it None for neutrality.
+        cuisine_preferences = build_meal_hints(preferences or "")
+        
         places_raw = maps_tool.run(
             location=location,
             activities=activity_terms if (preferences and activity_terms) else None,
-            cuisine_preferences=None,
+            cuisine_preferences=cuisine_preferences,
             max_results_per_query=20,
         )
 
+        #Fallback: if any of the meals are missing, requery meals only
+        if not (places_raw.get("breakfast") and places_raw.get("lunch") and places_raw.get("dinner")):
+            fallback = maps_tool.run(
+                location=location,
+                activities=None,
+                cuisine_preferences={"breakfast": [], "lunch": [], "dinner": []},
+                max_results_per_query=30,
+            )
+            # merge in anything missing
+            for k in ("breakfast", "lunch", "dinner"):
+                if not places_raw.get(k):
+                    places_raw[k] = fallback.get(k, [])
+
+        print({k: len(v) for k, v in places_raw.items()})
+
         # Make places compact + deterministic
-        places_compact = compact_places(places_raw, per_cat=6)
+        per_cat = min(20, max(6, days_count)) #up to 20 per category
+        k_activity = min(30, max(12, days_count * 3)) #rank more when trip is longer
+        k_meal = min(20, max(4, days_count)) # need >= days_count if no reuse
+
+        places_compact = compact_places(places_raw, per_cat=max(20, per_cat))
         candidates = flatten_candidates(places_compact)
-        addr_to_meta = place_lookup(places_compact)
+        addr_to_meta = place_lookup(places_compact) 
+
+        meal_cands = [c for c in candidates if c.get("category") in ("breakfast", "lunch", "dinner")]
+        act_cands = [c for c in candidates if c.get("category") not in ("breakfast", "lunch", "dinner")]
+
+        bundle = {"breakfast": [], "lunch": [], "dinner": [], "activities": []}
+        
+        vibes = extract_vibes(preferences or "")
+
+        diet_terms = ("vegan", "vegetarian", "gluten-free", "gluten free")
+        pref_lower = (preferences or "").lower()
+        diet_requested = any(t in pref_lower for t in diet_terms)
+
+        for meal in ("breakfast", "lunch", "dinner"):
+            per_meal = [c for c in meal_cands if c.get("category") == meal]
+
+            vibe_str = ", ".join(vibes) if vibes else "any"
+            diet_line = "Prioritize vegan/vegetarian/gluten-free suitability. " if diet_requested else ""
+            meal_pref = (
+                f"{preferences}. For {meal}: vibe={vibe_str}. "
+                f"{diet_line}"
+                "Prioritize local food and strong reviews."
+            )
+
+            bundle[meal] = semantic_rank(meal_pref, per_meal, top_k=k_meal)
+
+        bundle["activities"] = semantic_rank(preferences or "", act_cands, top_k=k_activity)
 
         # --------------------
         # 2) Python: Weather (once)
@@ -597,11 +752,16 @@ def generate_itinerary(location, start_date, end_date, preferences, transport_mo
         # --------------------
         # 3) Python: Semantic pre-rank (once)
         # --------------------
-        ranked = semantic_rank(preferences or "", candidates, top_k=30)
 
-        # split into meal lists + activity list (still preference-driven)
-        bundle = split_ranked_by_meals(ranked, k_meal=4, k_activity=10)
-
+        # ensure enough unique meal options for the number of days
+        for m in ("breakfast", "lunch", "dinner"):
+            if len(bundle.get(m, [])) < days_count:
+                return (
+                    "### Not enough meal options found\n"
+                    f"Need at least {days_count} unique {m} venues, but only found {len(bundle.get(m, []))}. "
+                    "Try broadening preferences or increasing max_results_per_query."
+                )
+            
         # --------------------
         # 5) LLM: Planner (no tools) — compact deterministic context
         # --------------------
@@ -624,11 +784,12 @@ def generate_itinerary(location, start_date, end_date, preferences, transport_mo
                 "Each activity.location MUST be exactly one of the provided place addresses (verbatim).",
                 "You must produce exactly trip_duration_days day-plans, matching the date range.",
                 "Keep each day within 08:00–22:00.",
+                "Each day MUST include exactly 1 breakfast, 1 lunch, and 1 dinner activity (choose from the provided meal lists).",
+                "DO NOT reuse venues.",
                 "Use weather to bias indoor vs outdoor choices (rain -> museums/indoor).",
                 "Do not worry about distance/time fields; Python will compute travel metrics after planning.",
                 "Still output travel_mode/distance_from_prev/duration_minutes fields (can be null).",
-                # IMPORTANT for Option A + matrix efficiency (even though we have pairwise fallback):
-                "Prefer <= 9 unique locations total across the itinerary to keep routing efficient.",
+                "Prefer <= 9 unique locations PER DAY to keep routing efficient."
             ],
         }
 
@@ -661,6 +822,16 @@ def generate_itinerary(location, start_date, end_date, preferences, transport_mo
             planned_obj = ItineraryModel.model_validate_json(raw)
 
         itinerary: ItineraryModel = planned_obj
+
+        used = set()
+        for day in itinerary.days:
+            for act in day.activities:
+                loc = (act.location or "").strip()
+                if not loc:
+                    continue
+                if loc in used:
+                    return "### Planner reused a venue\nTry increasing max_results_per_query or relax constraints."
+                used.add(loc)
 
         # --------------------
         # 6) Python: overwrite travel fields deterministically (THE FIX)

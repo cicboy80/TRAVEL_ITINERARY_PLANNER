@@ -37,25 +37,35 @@ class SemanticRankingTool(BaseTool):
 
         # 🧹 Sanitize inputs in case CrewAI passes metadata dicts
         if isinstance(user_preferences, dict):
-            user_preferences = user_preferences.get("description", str(user_preferences))
-        if isinstance(candidates, dict) and "description" in candidates:
-            candidates = candidates["description"]
+            user_preferences = user_preferences.get("description") or user_preferences.get("value") or str(user_preferences)
+        user_preferences = str(user_preferences).strip()
+
+        if isinstance(candidates, dict):
+            candidates = candidates.get("candidates") or candidates.get("items") or candidates.get("results") or candidates
+
         if not isinstance(candidates, list):
             raise ValueError("`candidates` must be a list of place dictionaries.")
 
-        client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
         if not candidates:
-            raise ValueError("No candidate places provided.")
+            return []
 
         # ✅ Build text representations of all candidates
-        texts = [
-            f"{c.get('name', '')}. {c.get('category', '')}. "
-            f"Rating: {c.get('rating', 'N/A')}. "
-            f"User reviews: {c.get('user_ratings_total', 'N/A')}."
-            for c in candidates
-        ]
+        texts = []
+        for c in candidates:
+            desc = (c.get("description") or "").strip()
+            if not desc:
+                types = ", ".join(c.get("types") or [])
+                price = c.get("price_level")
+                desc = (
+                    f"{c.get('name', '')}. {c.get('category', '')}. "
+                    f"rating: {c.get('rating', 'N/A')}. "
+                    f"reviews: {c.get('user_ratings_total', 'N/A')}. "
+                    f"price_level={price} types={types}. Address={c.get('address','')}"
+                )
+            texts.append(desc)
 
         # ✅ Batch embed (1 API call)
+        client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
         try:
             pref_emb = client.embeddings.create(
                 model="text-embedding-3-small",
@@ -78,9 +88,9 @@ class SemanticRankingTool(BaseTool):
         for place, emb_obj in zip(candidates, cand_embs):
             sim = cosine(pref_emb, emb_obj.embedding)
 
-            rating = place.get("rating", 0)
-            popularity = place.get("user_ratings_total", 0)
-            distance = place.get("distance_from_prev", 0) or 0
+            rating = place.get("rating") or 0.0
+            popularity = place.get("user_ratings_total") or 0
+            distance = place.get("distance_from_prev") or 0.0
 
             # ✅ Combine semantic, rating, popularity, distance
             score = (

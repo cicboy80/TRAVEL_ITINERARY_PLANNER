@@ -49,24 +49,42 @@ class GoogleMapsToolSchema(BaseModel):
         """
         Accepts:
           - {"breakfast":"pastry","lunch":"seafood",...}
+          - {"breakfast": ["vegan", "local"], "lunch":[],...}
           - "bolognese"
           - ["bolognese"]
-        Normalizes to dict or None.
+        Normalizes to dict[str, str] or None.
         """
         if v is None:
             return None
+        
+        def norm_val(val: Any) -> str:
+            if val is None:
+                return ""
+            if isinstance(val, list):
+                parts = [str(x).strip() for x in val if str(x).strip()]
+                return ", ".join(parts)
+            return str(val).strip()
+
         if isinstance(v, dict):
+            out = {}
             # normalize keys to lowercase
-            return {str(k).strip().lower(): str(val).strip() for k, val in v.items() if val}
+            for k, val in v.items():
+                key = str(k).strip().lower()
+                s = norm_val(val)
+                if s:
+                    out[key] = s
+            return out or None
+        
         if isinstance(v, list):
             # treat first item as a global cuisine hint
-            s = str(v[0]).strip() if v else ""
+            s = norm_val(v)
             return {"breakfast": s, "lunch": s, "dinner": s} if s else None
+        
         if isinstance(v, str):
             s = v.strip()
             return {"breakfast": s, "lunch": s, "dinner": s} if s else None
+        
         return None
-
 
 class GoogleMapsTool(BaseTool):
     """
@@ -120,15 +138,12 @@ class GoogleMapsTool(BaseTool):
 
         with httpx.Client(timeout=15.0) as client:
             for category in categories:
-                cuisine = None
-
                 if category in meal_categories:
-                    cuisine = (cuisine_preferences or {}).get(category) if cuisine_preferences else None
-                    query = (
-                        f"{cuisine} {category} in {location}"
-                        if cuisine
-                        else f"{category} restaurants in {location}"
-                    )
+                    hint = (cuisine_preferences or {}).get(category)
+                    if hint:
+                        query = f"{hint} {category} in {location}"
+                    else:
+                        query = f"{category} restaurants in {location}"
                 else:
                     # preference-driven term, no hardcoded “bar/craft beer” expansions
                     query = f"{category} in {location}"
@@ -156,6 +171,9 @@ class GoogleMapsTool(BaseTool):
                         "lng": r.get("geometry", {}).get("location", {}).get("lng"),
                         "user_ratings_total": r.get("user_ratings_total"),
                         "place_id": r.get("place_id"),
+                        "types": r.get("types", []),
+                        "price_level": r.get("price_level"),
+                        "business_status": r.get("business_status"),
                     }
                     for r in data.get("results", [])[:max_results_per_query]
                 ]
