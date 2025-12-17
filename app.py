@@ -819,10 +819,14 @@ def generate_itinerary(location, start_date, end_date, preferences, transport_mo
                     f"Need at least {days_count} unique {m} venues, but only found {len(bundle.get(m, []))}. "
                     "Try broadening preferences or increasing max_results_per_query."
                 )
+        
+        print("✅ Bundle sizes:", {m: len(bundle.get(m, [])) for m in ("breakfast","lunch","dinner")},
+            "activities:", len(bundle.get("activities", [])))
             
         # --------------------
         # 5) LLM: Planner (no tools) — compact deterministic context
         # --------------------
+        print("➡️ Planner: building context_json")
         context_json = {
             "location": location,
             "start_date": start_date_iso,
@@ -854,6 +858,7 @@ def generate_itinerary(location, start_date, end_date, preferences, transport_mo
             ],
         }
 
+        print("➡️ Planner: creating planning_task")
         planning_task = Task(
             description=(
                 "Build an itinerary ONLY from the provided CONTEXT_JSON. Never invent places.\n\n"
@@ -871,7 +876,9 @@ def generate_itinerary(location, start_date, end_date, preferences, transport_mo
             verbose=True,
         )
 
+        print("➡️ Planner: kickoff starting")
         _ = planner_crew.kickoff()
+        print("✅ Planner: kickoff finished")
 
         # Extract the Pydantic object (CrewAI stores in task.output)
         planned = getattr(planning_task, "output", None)
