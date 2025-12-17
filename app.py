@@ -695,10 +695,10 @@ def generate_itinerary(location, start_date, end_date, preferences, transport_mo
 
         # Make places compact + deterministic
         per_cat = min(20, max(6, days_count)) #up to 20 per category
-        k_activity = min(30, max(12, days_count * 3)) #rank more when trip is longer
-        k_meal = min(20, max(4, days_count)) # need >= days_count if no reuse
+        k_activity = min(60, max(24, days_count * 8)) #rank more when trip is longer
+        k_meal = min(30, max(6, days_count * 3)) # need >= days_count if no reuse
 
-        places_compact = compact_places(places_raw, per_cat=max(20, per_cat))
+        places_compact = compact_places(places_raw, per_cat=per_cat)
         candidates = flatten_candidates(places_compact)
         addr_to_meta = place_lookup(places_compact) 
 
@@ -743,7 +743,7 @@ def generate_itinerary(location, start_date, end_date, preferences, transport_mo
         picked_addr: set[str] = set()
 
         # enough unique options so the planner can actually pick them across days
-        per_must = min(8, max(3, days_count))  # e.g. 3–8 per must category
+        per_must = min(20, max(6, days_count * 3))  # e.g. 3–8 per must category
 
         for cat in must_cats:
            cat_cands = [c for c in act_cands if (c.get("category") or "").lower().strip() == cat]
@@ -787,11 +787,13 @@ def generate_itinerary(location, start_date, end_date, preferences, transport_mo
         # --------------------
         # 2) Python: Weather (once)
         # --------------------
+        print("➡️ Weather: calling weather_tool.run()")
         weather_raw = weather_tool.run(
             city=location,
             start_date=start_date_iso,
             end_date=end_date_iso,
         )
+        print("✅ Weather: returned from weather_tool.run()")
 
         # Convert weather list -> date map
         weather_by_date: Dict[str, Dict[str, Any]] = {}
@@ -841,6 +843,7 @@ def generate_itinerary(location, start_date, end_date, preferences, transport_mo
                 "You must produce exactly trip_duration_days day-plans, matching the date range.",
                 "Keep each day within 08:00–22:00.",
                 "Each day MUST include exactly 1 breakfast, 1 lunch, and 1 dinner activity (choose from the provided meal lists).",
+                "Each day should include 2–4 non-meal activities (in addition to breakfast/lunch/dinner), unless weather is severe or options are limited.",
                 "If preferences mention museums, landmarks, parks, or art — and matching categories exist in places.activities — include at least 1 activity per day from those matched categories before choosing other activities.",
                 "DO NOT reuse venues.",
                 "Do not schedule bars before 12:00.",
