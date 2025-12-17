@@ -726,7 +726,63 @@ def generate_itinerary(location, start_date, end_date, preferences, transport_mo
 
             bundle[meal] = semantic_rank(meal_pref, per_meal, top_k=k_meal)
 
-        bundle["activities"] = semantic_rank(preferences or "", act_cands, top_k=k_activity)
+        # -------------- Balanced activities ---------------
+        prefs_l = (preferences or "").lower()
+
+        must_cats: List[str] = []
+        if "museum" in prefs_l:
+            must_cats.append("museums")
+        if "landmark" in prefs_l:
+            must_cats.append("landmarks")
+        if "park" in prefs_l:
+            must_cats.append("parks")
+        if "art" in prefs_l:
+            must_cats.append("art")
+
+        picked: List[Dict[str, Any]] = []
+        picked_addr: set[str] = set()
+
+        # enough unique options so the planner can actually pick them across days
+        per_must = min(8, max(3, days_count))  # e.g. 3–8 per must category
+
+        for cat in must_cats:
+           cat_cands = [c for c in act_cands if (c.get("category") or "").lower().strip() == cat]
+           # rank within that category using a category-focused query
+           ranked_cat = semantic_rank(f"{cat}. {preferences or ''}", cat_cands, top_k=per_must)
+           for x in ranked_cat:
+               addr = (x.get("address") or "").lower().strip()
+               if not addr or addr in picked_addr:
+                   continue
+               picked.append(x)
+               picked_addr.add(addr)
+        
+        # fill remaining with global ranking, but diversify so one category doesn't take over
+        remaining_slots = max(0, k_activity - len(picked))
+        ranked_all = semantic_rank(
+            preferences or "",
+            [c for c in act_cands if (c.get("address") or "").lower().strip() not in picked_addr],
+            top_k=max(remaining_slots * 3, remaining_slots)  # overfetch for diversity
+        )
+
+        per_cat_cap = 3
+        counts: Dict[str, int] = {}
+        fill: List[Dict[str, Any]] = []
+
+        for x in ranked_all:
+            cat = (x.get("category") or "other").lower().strip()
+            if counts.get(cat, 0) >= per_cat_cap:
+                continue
+            fill.append(x)
+            counts[cat] = counts.get(cat, 0) + 1
+            if len(fill) >= remaining_slots:
+                break
+
+        bundle["activities"] = picked + fill
+
+        # debug
+        print("✅ Activities bundle category counts:",
+              {k: sum(1 for a in bundle["activities"] if (a.get("category") or "").lower() == k)
+               for k in sorted({(a.get("category") or "").lower() for a in bundle["activities"]})})
 
         # --------------------
         # 2) Python: Weather (once)
@@ -785,7 +841,9 @@ def generate_itinerary(location, start_date, end_date, preferences, transport_mo
                 "You must produce exactly trip_duration_days day-plans, matching the date range.",
                 "Keep each day within 08:00–22:00.",
                 "Each day MUST include exactly 1 breakfast, 1 lunch, and 1 dinner activity (choose from the provided meal lists).",
+                "If preferences mention museums, landmarks, parks, or art — and matching categories exist in places.activities — include at least 1 activity per day from those matched categories before choosing other activities.",
                 "DO NOT reuse venues.",
+                "Do not schedule bars before 12:00.",
                 "Use weather to bias indoor vs outdoor choices (rain -> museums/indoor).",
                 "Do not worry about distance/time fields; Python will compute travel metrics after planning.",
                 "Still output travel_mode/distance_from_prev/duration_minutes fields (can be null).",
