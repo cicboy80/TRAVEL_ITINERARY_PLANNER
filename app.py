@@ -77,7 +77,8 @@ def extract_activity_terms(preferences: str, max_terms: int = 8) -> List[str]:
             raw.append(term)
 
     # skip meal/food intent tokens (still not hardcoding venues)
-    skip_tokens = ("food", "restaurant", "cuisine", "breakfast", "lunch", "dinner", "eat", "eating")
+    skip_tokens = ("food", "restaurant", "cuisine", "breakfast", "lunch", "dinner", "eat", "eating",
+                   "vegan", "vegetarian", "gluten-free", "gluten free")
     out: List[str] = []
     for t in raw:
         tl = t.lower()
@@ -119,7 +120,7 @@ def compact_places(places_by_cat: Dict[str, List[Dict[str, Any]]], per_cat: int 
 
         cleaned: List[Dict[str, Any]] = []
         for x in items_sorted:
-            addr = (x.get("address") or "").strip()
+            addr = (x.get("address") or x.get("formatted_address") or x.get("vicinity") or "").strip()
             if not addr:
                 continue
             cleaned.append(
@@ -441,6 +442,21 @@ def choose_mode_for_leg(
 
     return None
 
+def merge_unique_by_address(primary, secondary, limit):
+    def key(x):
+        return (x.get("place_id") or x.get("address") or "").lower().strip()
+    
+    seen = set(key(p) for p in primary if key(p))
+    out = list(primary)
+    for x in secondary:
+        k = key(x)
+        if not k or k in seen:
+            out.append(x)
+            seen.add(k)
+        if len(out) >= limit:
+            break
+    return out
+
 def compute_leg_metrics_from_matrix(
     routes: Dict[str, Any],
     allowed_modes: List[str],
@@ -724,7 +740,18 @@ def generate_itinerary(location, start_date, end_date, preferences, transport_mo
                 "Prioritize local food and strong reviews."
             )
 
-            bundle[meal] = semantic_rank(meal_pref, per_meal, top_k=k_meal)
+            ranked = semantic_rank(meal_pref, per_meal, top_k=k_meal)
+
+            # If ranking is too strict or insufficient returns, fill with high-quality defaults
+            if len(ranked) < days_count:
+                fallback_sorted = sorted(
+                    per_meal,
+                    key=lambda x: ((x.get("rating") or 0), (x.get("user_ratings_total") or 0)),
+                    reverse=True,
+                )
+                ranked = merge_unique_by_address(ranked, fallback_sorted, limit=k_meal)
+
+            bundle[meal] = ranked
 
         # -------------- Balanced activities ---------------
         prefs_l = (preferences or "").lower()
