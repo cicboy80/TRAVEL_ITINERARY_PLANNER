@@ -742,6 +742,8 @@ def generate_itinerary(location, start_date, end_date, preferences, transport_mo
 
             ranked = semantic_rank(meal_pref, per_meal, top_k=k_meal)
 
+            print(f"🍽️ {meal}: per_meal={len(per_meal)} ranked={len(ranked)} days={days_count}")
+
             # If ranking is too strict or insufficient returns, fill with high-quality defaults
             if len(ranked) < days_count:
                 fallback_sorted = sorted(
