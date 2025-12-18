@@ -101,14 +101,20 @@ def to_iso_date(d: Any) -> str:
 # ----------------------------
 # Helpers (data shaping)
 # ----------------------------
+
+MEAL_CATS = {"breakfast", "lunch", "dinner"}
+
 def compact_places(places_by_cat: Dict[str, List[Dict[str, Any]]], per_cat: int = 6) -> Dict[str, List[Dict[str, Any]]]:
     """
     Keep only fields we need + cap count per category to keep planner context compact.
+    IMPORTANT: meal buckets must stay labeled as breakfast/lunch/dinner (even if the raw item has category like "vegetarian").
     """
     out: Dict[str, List[Dict[str, Any]]] = {}
     for cat, items in (places_by_cat or {}).items():
         if not isinstance(items, list):
             continue
+        
+        cat_norm = (cat or "").lower().strip()
 
         # Sort roughly by "quality": rating desc, then user_ratings_total desc
         def score(x: Dict[str, Any]) -> Tuple[float, int]:
@@ -123,11 +129,14 @@ def compact_places(places_by_cat: Dict[str, List[Dict[str, Any]]], per_cat: int 
             addr = (x.get("address") or x.get("formatted_address") or x.get("vicinity") or "").strip()
             if not addr:
                 continue
+            raw_item_cat = (x.get("category") or "").strip()
+            item_cat = cat_norm if cat_norm in MEAL_CATS else (raw_item_cat or cat).strip()
+
             cleaned.append(
                 {
                     "name": (x.get("name") or "").strip(),
                     "address": addr,
-                    "category": (x.get("category") or cat).strip(),
+                    "category": item_cat,
                     "rating": x.get("rating"),
                     "user_ratings_total": x.get("user_ratings_total"),
                     "place_id": x.get("place_id"),
@@ -174,13 +183,18 @@ def flatten_candidates(compact: Dict[str, List[Dict[str, Any]]]) -> List[Dict[st
                 }
             )
     # de-dupe by address (preserve order)
+    # For meals: allow same address to exist in breakfast AND lunch AND dinner (key = category+address)
     seen = set()
     out = []
     for x in cands:
-        k = x["address"].lower()
-        if k in seen:
+        addr = (x.get("address") or "").lower().strip()
+        cat = (x.get("category") or "").lower().strip()
+
+        key = f"{cat}::{addr}" if cat in MEAL_CATS else addr
+
+        if key in seen:
             continue
-        seen.add(k)
+        seen.add(key)
         out.append(x)
     return out
 
@@ -715,6 +729,9 @@ def generate_itinerary(location, start_date, end_date, preferences, transport_mo
         k_meal = min(30, max(6, days_count * 3)) # need >= days_count if no reuse
 
         places_compact = compact_places(places_raw, per_cat=per_cat)
+        print("DEBUG dinner compact count:", len(places_compact.get("dinner", [])))
+        print("DEBUG dinner compact categories:", [p.get("category") for p in places_compact.get("dinner", [])])
+        
         candidates = flatten_candidates(places_compact)
         addr_to_meta = place_lookup(places_compact) 
 
