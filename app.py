@@ -465,8 +465,9 @@ def merge_unique_by_address(primary, secondary, limit):
     for x in secondary:
         k = key(x)
         if not k or k in seen:
-            out.append(x)
-            seen.add(k)
+            continue
+        out.append(x)
+        seen.add(k)
         if len(out) >= limit:
             break
     return out
@@ -824,6 +825,12 @@ def generate_itinerary(location, start_date, end_date, preferences, transport_mo
                 break
 
         bundle["activities"] = picked + fill
+
+        # Ensure no meal items leak into activities
+        bundle["activities"] = [
+            p for p in (bundle.get("activities") or [])
+            if (p.get("category") or "").lower().strip() not in MEAL_CATS
+        ]
 
         # debug
         print("✅ Activities bundle category counts:",
