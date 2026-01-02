@@ -330,7 +330,7 @@ def build_meal_hints(preferences: str) -> Dict[str, Optional[str]]:
         "michelin": "michelin star",
     }
 
-    # extract (order matters; keep short)
+    # extract
     dietary = []
     for key in ("vegan", "vegetarian", "gluten-free", "gluten free"):
         if key in tokens:
@@ -838,7 +838,7 @@ def generate_itinerary(location, start_date, end_date, preferences, transport_mo
                for k in sorted({(a.get("category") or "").lower() for a in bundle["activities"]})})
 
         # --------------------
-        # 2) Python: Weather (once)
+        # 2) Python: Weather
         # --------------------
         print("➡️ Weather: calling weather_tool.run()")
         weather_raw = weather_tool.run(
@@ -861,7 +861,7 @@ def generate_itinerary(location, start_date, end_date, preferences, transport_mo
             }
 
         # --------------------
-        # 3) Python: Semantic pre-rank (once)
+        # 3) Python: Semantic pre-rank
         # --------------------
 
         # ensure enough unique meal options for the number of days
@@ -877,7 +877,7 @@ def generate_itinerary(location, start_date, end_date, preferences, transport_mo
             "activities:", len(bundle.get("activities", [])))
             
         # --------------------
-        # 5) LLM: Planner (no tools) — compact deterministic context
+        # 5) LLM: Planner
         # --------------------
         print("➡️ Planner: building context_json")
         context_json = {
@@ -955,7 +955,7 @@ def generate_itinerary(location, start_date, end_date, preferences, transport_mo
                 used.add(loc)
 
         # --------------------
-        # 6) Python: overwrite travel fields deterministically (THE FIX)
+        # 6) Python: overwrite travel fields deterministically
         # --------------------
         itinerary = postprocess_itinerary(
             itinerary=itinerary,

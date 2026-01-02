@@ -1,0 +1,26 @@
+# secrets
+.env
+*.env
+api_keys.env
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# OS/IDE
+.DS_Store
+.vscode/
+.idea/
+
+# logs/temp
+*.log
+/tmp/
+
+# caches / local data
+*.sqlite
+*.db
+
+# gradio artifacts
+.gradio/

@@ -9,7 +9,6 @@ from utils.cache import SQLiteCache
 
 cache = SQLiteCache("/tmp/cache.sqlite")
 
-
 class RoutePlannerToolSchema(BaseModel):
     model_config = ConfigDict(extra="ignore")
     origin: str

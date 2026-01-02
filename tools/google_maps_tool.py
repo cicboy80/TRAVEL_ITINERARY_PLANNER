@@ -7,7 +7,6 @@ from utils.cache import SQLiteCache
 
 cache = SQLiteCache("/tmp/cache.sqlite")
 
-
 class GoogleMapsToolSchema(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
@@ -145,10 +144,10 @@ class GoogleMapsTool(BaseTool):
                     else:
                         query = f"{category} restaurants in {location}"
                 else:
-                    # preference-driven term, no hardcoded “bar/craft beer” expansions
+                    # preference-driven term
                     query = f"{category} in {location}"
 
-                # cache by query (safer than category-only)
+                # cache by query 
                 qk = query.strip().lower()
                 cache_key = f"places::q::{qk}"
                 cached = cache.get(cache_key)
