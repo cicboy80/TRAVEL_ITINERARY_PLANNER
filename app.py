@@ -1058,10 +1058,14 @@ with gr.Blocks(theme=gr.themes.Soft()) as demo:
 
 demo.queue(default_concurrency_limit=1, max_size=20)
 
+# ✅ Hugging Face expects a top-level `app`
+app = demo
+
 if __name__ == "__main__":
+    import os
     demo.launch(
         server_name="0.0.0.0",
-        server_port=7860,
+        server_port=int(os.getenv("PORT", 7860)),
         show_error=True,
         max_threads=1,
         ssr_mode=False,
