@@ -11,19 +11,19 @@ license: apache-2.0
 short_description: AI-powered travel itinerary planner
 ---
 
-# Travel Itinerary Planner 🧭✨
+# Travel Itinerary Planner
 
-An interactive **Gradio** app that generates a day-by-day travel itinerary based on your destination, dates, preferences, and transport mode. It combines structured routing + POI retrieval with LLM-assisted planning to produce a clear, usable plan.
+An AI-powered travel planning system that generates multi-day itineraries by combining real-world POI retrieval, deterministic routing, and constrained LLM-assisted planning.
 
-> ⚠️ Educational project only — use at your own discretion.
+⚠️ Educational and experimental project — outputs should be reviewed before real-world use.
 
 ## What it does
-- **Builds a multi-day itinerary** from start/end dates
-- **Finds relevant places (POIs)** based on your preferences
-- **Plans routes between stops** (e.g., walking/transit/driving)
-- **Considers weather** to improve day planning (when enabled)
-- **Ranks options semantically** to match your interests
-- **Outputs a structured itinerary** you can copy or adapt
+- **Builds a multi-day itinerary** from user-specified dates and destination
+- **Retrieves relevant places (POIs)** using Google Maps based on preferences
+- **Applies deterministic routing** (e.g., walking/transit/driving) between stops
+- **Incorporates weather data** to adjust daily planning (when enabled)
+- **Semantically ranks** options to match user interests
+- **Outputs a clean, structured itinerary** suitable for reuse or export
 
 ## Project structure
 ```text
@@ -59,7 +59,7 @@ source .venv/bin/activate   # macOS/Linux
 pip install -r requirements.txt
 ```
 
-### 2. Environmental variables
+### 2. Environment variables
 
 This project uses API keys for **OpenAI** and **GOOGLE_MAPS_API**.
 
@@ -93,7 +93,7 @@ Add required keys under Settings → Secrets in your Space:
 - Never commit secrets (API keys, tokens, .env, certificates)
 - Prefer platform secret managers (Hugging Face Secrets / cloud secret stores)
 
-## Roadmap
+## Roadmap (optional enhancements)
 
 - Add richer itinerary outputs (maps/export)
 - Improve caching + rate-limit handling
